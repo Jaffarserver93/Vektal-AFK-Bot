@@ -10,6 +10,8 @@
     "linkpays-deep-probe": "tsx ./src/linkpays-deep-probe.ts",
     "linkpays-full-flow": "tsx ./src/linkpays-full-flow.ts",
     "earn-form-probe": "tsx ./src/earn-form-probe.ts",
+    "linkpays-complete-probe": "tsx ./src/linkpays-complete-probe.ts",
+    "linkpays-bypasser": "tsx ./src/linkpays-bypasser.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

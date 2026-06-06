@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "python-3.11"]
 
 [deployment]
 router = "application"
@@ -35,6 +35,14 @@ args = "LinkPays Full Flow"
 [[workflows.workflow.tasks]]
 task = "workflow.run"
 args = "Earn Form Probe"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LinkPays Complete Probe"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LinkPays Bypasser"
 
 [[workflows.workflow]]
 name = "AFK Bot"
@@ -87,6 +95,28 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run earn-form-probe 2>&1 | tee /tmp/earn-form-probe.txt"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "LinkPays Complete Probe"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run linkpays-complete-probe 2>&1 | tee /tmp/complete-probe.txt"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "LinkPays Bypasser"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run linkpays-bypasser 2>&1 | tee /tmp/bypasser.txt"
 
 [workflows.workflow.metadata]
 outputType = "console"
