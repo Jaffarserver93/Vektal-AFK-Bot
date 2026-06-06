@@ -24,6 +24,10 @@ args = "AFK Bot"
 task = "workflow.run"
 args = "LinkPays Probe"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LinkPays Deep Probe"
+
 [[workflows.workflow]]
 name = "AFK Bot"
 author = "agent"
@@ -45,6 +49,17 @@ args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "LinkPays Deep Probe"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run linkpays-deep-probe 2>&1 | tee /tmp/deep-probe-report.txt"
 
 [agent]
 stack = "PNPM_WORKSPACE"
