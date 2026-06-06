@@ -5,10 +5,15 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
+    "afk-bot": "tsx ./src/afk-bot.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "catalog:",
     "tsx": "catalog:"
+  },
+  "dependencies": {
+    "puppeteer": "^25.1.0",
+    "puppeteer-real-browser": "^1.4.4"
   }
 }
