@@ -44,6 +44,10 @@ args = "LinkPays Complete Probe"
 task = "workflow.run"
 args = "LinkPays Bypasser"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
 [[workflows.workflow]]
 name = "AFK Bot"
 author = "agent"
@@ -121,8 +125,20 @@ args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin
 [workflows.workflow.metadata]
 outputType = "console"
 
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/api-server run dev"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
@@ -137,5 +153,14 @@ externalPort = 80
 localPort = 8081
 externalPort = 8081
 
+[[ports]]
+localPort = 5000
+externalPort = 80
+
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+PORT = "5000"
