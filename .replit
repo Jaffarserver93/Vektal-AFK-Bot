@@ -20,6 +20,10 @@ author = "agent"
 task = "workflow.run"
 args = "AFK Bot"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LinkPays Probe"
+
 [[workflows.workflow]]
 name = "AFK Bot"
 author = "agent"
@@ -30,6 +34,17 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run afk-bot"
+
+[[workflows.workflow]]
+name = "LinkPays Probe"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run linkpays-probe"
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"

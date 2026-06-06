@@ -6,6 +6,7 @@
   "scripts": {
     "hello": "tsx ./src/hello.ts",
     "afk-bot": "tsx ./src/afk-bot.ts",
+    "linkpays-probe": "tsx ./src/linkpays-probe.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
