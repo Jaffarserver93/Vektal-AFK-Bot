@@ -48,6 +48,10 @@ args = "LinkPays Bypasser"
 task = "workflow.run"
 args = "Start application"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "LinkPays Runner"
+
 [[workflows.workflow]]
 name = "AFK Bot"
 author = "agent"
@@ -136,6 +140,17 @@ waitForPort = 5000
 
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow]]
+name = "LinkPays Runner"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin:$PATH pnpm --filter @workspace/scripts run linkpays-runner 2>&1 | tee /tmp/linkpays-runner.txt"
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [agent]
 stack = "BEST_EFFORT_FALLBACK"
