@@ -8,6 +8,8 @@
     "afk-bot": "tsx ./src/afk-bot.ts",
     "linkpays-probe": "tsx ./src/linkpays-probe.ts",
     "linkpays-deep-probe": "tsx ./src/linkpays-deep-probe.ts",
+    "linkpays-full-flow": "tsx ./src/linkpays-full-flow.ts",
+    "earn-form-probe": "tsx ./src/earn-form-probe.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
