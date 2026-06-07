@@ -18,6 +18,7 @@
 import { connect } from "puppeteer-real-browser";
 import { spawn, type ChildProcess } from "child_process";
 import { appendFileSync } from "fs";
+import { createServer } from "http";
 
 const SITE         = "https://vektalnodes.in";
 const EMAIL        = process.env.VEKTAL_EMAIL    ?? "";
@@ -201,7 +202,20 @@ async function scrollToBottom(page: any) {
 
 async function login(page: any) {
   log("Navigating to /login…");
-  await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+
+  // Retry up to 3 times — Render's cold-start network can be slow on first request
+  let navOk = false;
+  for (let attempt = 1; attempt <= 3 && !navOk; attempt++) {
+    try {
+      await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 120_000 });
+      navOk = true;
+    } catch (err: any) {
+      log(`Login nav attempt ${attempt} failed: ${err?.message ?? err}. Retrying…`);
+      await sleep(5_000);
+    }
+  }
+  if (!navOk) throw new Error("Login page navigation failed after 3 attempts");
+
   await waitForCF(page);
   await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 30_000 }).catch(() => {});
   await sleep(600);
@@ -209,7 +223,7 @@ async function login(page: any) {
   let emailEl = await page.$('input[type="email"], input[name="email"]');
   if (!emailEl) {
     log("Email input not found — reloading…");
-    await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 120_000 });
     await waitForCF(page);
     await sleep(800);
     emailEl = await page.$('input[type="email"], input[name="email"]');
@@ -251,33 +265,108 @@ async function getCoins(page: any): Promise<number> {
 }
 
 async function getLinkPaysStatus(page: any): Promise<{
-  available: boolean; cooldownSec: number; flashMsg: string;
+  available: boolean;
+  cooldownSec: number;
+  flashMsg: string;
+  usageToday: number;      // X from "24h usage: X / 10"
+  usageMax: number;        // Y from "24h usage: X / Y"
+  msUntilNextSlot: number; // parsed from "Next slot opens in Xh Xm" — 0 if slots available now
 }> {
+  // NOTE: Do NOT define named `const fn = () => {}` inside page.evaluate() — esbuild (used
+  // by tsx) injects `__name(fn,"fn")` for every named binding, and __name is not available
+  // in the browser context that Puppeteer serialises the callback into.
+  // All helpers here are inlined as plain expressions to avoid that.
   return page.evaluate(() => {
     const doc = (globalThis as any).document;
-    // Read flash/alert message from the page
-    const flashEl = doc.querySelector(".alert, .flash, [role='alert'], .notice");
-    const flashMsg: string = flashEl ? (flashEl.innerText ?? flashEl.textContent ?? "").trim() : "";
 
-    const cards = Array.from(doc.querySelectorAll("article.offer-card"));
+    // Flash/alert message
+    const flashEl = doc.querySelector(".alert, .flash, [role='alert'], .notice");
+    const flashMsg: string = flashEl
+      ? ((flashEl.textContent ?? flashEl.innerText ?? "") as string).trim()
+      : "";
+
+    // Find the LinkPays offer card — check every article.offer-card for "linkpays" text
+    const cards: any[] = Array.from(doc.querySelectorAll("article.offer-card"));
     let lpCard: any = null;
-    for (const c of cards as any[]) {
-      const h = (c as any).querySelector("h3")?.innerText ?? "";
-      if (h.toLowerCase().includes("linkpays")) { lpCard = c; break; }
+    for (let ci = 0; ci < cards.length; ci++) {
+      const c = cards[ci];
+      // Check heading/eyebrow elements
+      const heads: any[] = Array.from(c.querySelectorAll("h2,h3,h4,p.eyebrow,.eyebrow"));
+      let match = false;
+      for (let hi = 0; hi < heads.length; hi++) {
+        const t = ((heads[hi].textContent ?? heads[hi].innerText ?? "") as string)
+                    .trim().toLowerCase();
+        if (t.includes("linkpays")) { match = true; break; }
+      }
+      if (!match) {
+        // Wider fallback: any text in the card
+        const full = ((c.textContent ?? c.innerText ?? "") as string).toLowerCase();
+        match = full.includes("linkpays");
+      }
+      if (match) { lpCard = c; break; }
     }
+
     if (!lpCard) {
-      // Fallback: look for any submit button
-      const btn = doc.querySelector('button.button-primary[type="submit"]');
-      return { available: !!btn && !(btn as any).disabled, cooldownSec: 0, flashMsg };
+      // No LP card found — return unavailable with safe defaults
+      const anyBtn = doc.querySelector('button.button-primary[type="submit"]');
+      return { available: false, cooldownSec: 0, flashMsg,
+               usageToday: 0, usageMax: 10, msUntilNextSlot: 0,
+               _dbg: `no-lp-card|total-cards:${cards.length}` };
     }
-    const btn = lpCard.querySelector("button.button-primary[type='submit']");
-    const available = !!btn && !(btn as any).disabled;
-    const expireEl = lpCard.querySelector("[data-expire-seconds]");
+
+    // Button availability
+    const btn: any = lpCard.querySelector("button.button-primary[type='submit']")
+                  ?? lpCard.querySelector("button[type='submit']");
+    const available = !!btn && !btn.disabled;
+
+    // Active-session countdown (data-expire-seconds on timer element)
+    const expireEl: any = lpCard.querySelector("[data-expire-seconds]");
     const cooldownSec = expireEl
-      ? parseInt((expireEl as any).getAttribute("data-expire-seconds") ?? "0", 10)
+      ? parseInt(expireEl.getAttribute("data-expire-seconds") ?? "0", 10)
       : 0;
-    return { available, cooldownSec, flashMsg };
-  }).catch(() => ({ available: false, cooldownSec: 0, flashMsg: "" }));
+
+    // Parse "24h usage: X / Y" from .status-pill elements (use textContent, not innerText)
+    let usageToday = 0;
+    let usageMax   = 10;
+    const pillEls: any[] = Array.from(lpCard.querySelectorAll(".status-pill"));
+    let pillTexts = "";
+    for (let pi = 0; pi < pillEls.length; pi++) {
+      const t = ((pillEls[pi].textContent ?? pillEls[pi].innerText ?? "") as string).trim();
+      pillTexts += (pi ? "|" : "") + t;
+      const mu = t.match(/24h usage:\s*(\d+)\s*\/\s*(\d+)/i);
+      if (mu) { usageToday = parseInt(mu[1]); usageMax = parseInt(mu[2]); }
+    }
+
+    // Parse "Next slot opens in Xh Xm" from pills or paragraphs
+    let msUntilNextSlot = 0;
+    // Combine pill and paragraph text for the search
+    const paraEls: any[] = Array.from(lpCard.querySelectorAll("p"));
+    const allTexts: string[] = [];
+    for (let pi = 0; pi < pillEls.length; pi++) {
+      allTexts.push(((pillEls[pi].textContent ?? "") as string).trim());
+    }
+    for (let pi = 0; pi < paraEls.length; pi++) {
+      allTexts.push(((paraEls[pi].textContent ?? "") as string).trim());
+    }
+    for (let ti = 0; ti < allTexts.length; ti++) {
+      const t = allTexts[ti];
+      if (t.toLowerCase().includes("next slot") || t.toLowerCase().includes("slot opens")) {
+        // Inline time parse: "Xh Ym", "Xh", "Ym"
+        const hm = t.match(/(\d+)h\s*(\d+)m/);
+        if (hm) { msUntilNextSlot = (parseInt(hm[1]) * 3600 + parseInt(hm[2]) * 60) * 1000; break; }
+        const ho = t.match(/(\d+)\s*h/);
+        if (ho) { msUntilNextSlot = parseInt(ho[1]) * 3600000; break; }
+        const mo = t.match(/(\d+)\s*m/);
+        if (mo) { msUntilNextSlot = parseInt(mo[1]) * 60000; break; }
+      }
+    }
+
+    return { available, cooldownSec, flashMsg, usageToday, usageMax, msUntilNextSlot,
+             _dbg: `cards:${cards.length}|lp:found|btn:${!!btn}|avail:${available}|exp:${cooldownSec}|pills:[${pillTexts}]` };
+  }).catch((err: any) => {
+    // Surface the real error so it appears in runner logs
+    throw new Error(`getLinkPaysStatus evaluate failed: ${err?.message ?? String(err)}`);
+  });
 }
 
 // ─── Ad-page flow (rank1st.in / savepe.in) ───────────────────────────────────
@@ -598,7 +687,13 @@ async function handleLinkpays(page: any): Promise<void> {
 // Also tracks new-tab creation: if the button click spawns a popup/new window,
 // we switch to that new tab as our active page.
 
-async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolean; cooldownSec: number }> {
+async function runOneCycle(browser: any, cycleNum: number): Promise<{
+  ok: boolean;
+  cooldownSec: number;
+  msUntilNextSlot: number; // >0 when 24h limit reached — how long until next slot opens
+  usageToday: number;
+  usageMax: number;
+}> {
   const SEP = "═".repeat(70);
   log(`\n${SEP}`);
   log(`CYCLE ${cycleNum} START`);
@@ -612,6 +707,8 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
   });
   if (!cyclePage) throw new Error("Could not open a page for this cycle.");
   await cyclePage.setViewport({ width: 1280, height: 900 }).catch(() => {});
+  // Forward console messages from cyclePage so page.evaluate console.log appears in runner logs
+  cyclePage.on("console", (msg: any) => log(`[PAGE] ${msg.text()}`));
 
   // Track new tabs opened during this cycle so we can follow them
   let newTabPage: any = null;
@@ -651,20 +748,25 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
     // Check if redirected to login (session expired)
     if (cyclePage.url().includes("/login")) {
       log("Session expired — aborting cycle. Re-login needed.");
-      return { ok: false, cooldownSec: 0 };
+      return { ok: false, cooldownSec: 0, msUntilNextSlot: 0, usageToday: 0, usageMax: 10 };
     }
 
     const coinsBefore = await getCoins(cyclePage);
     const status      = await getLinkPaysStatus(cyclePage);
-    log(`Coins: ${coinsBefore} | LP available: ${status.available} | Cooldown: ${status.cooldownSec}s`);
+    log(`Coins: ${coinsBefore} | LP available: ${status.available} | Cooldown: ${status.cooldownSec}s | Usage: ${status.usageToday}/${status.usageMax} | dbg: ${(status as any)._dbg}`);
 
     if (!status.available) {
       if (status.cooldownSec > 0) {
         log(`Cooldown active: ${status.cooldownSec}s.`);
-        return { ok: false, cooldownSec: status.cooldownSec };
+        return { ok: false, cooldownSec: status.cooldownSec, msUntilNextSlot: 0, usageToday: status.usageToday, usageMax: status.usageMax };
       }
-      log("LP button not available — 24h limit or other block.");
-      return { ok: false, cooldownSec: 0 };
+      // 24h limit hit — report next-slot time so the main loop can sleep correctly
+      if (status.msUntilNextSlot > 0) {
+        log(`24h limit reached (${status.usageToday}/${status.usageMax}). Next slot in ${Math.round(status.msUntilNextSlot / 60_000)}min.`);
+      } else {
+        log("LP button not available — 24h limit or other block.");
+      }
+      return { ok: false, cooldownSec: 0, msUntilNextSlot: status.msUntilNextSlot, usageToday: status.usageToday, usageMax: status.usageMax };
     }
 
     // ── Step 1: Click the LinkPays button ──────────────────────────────────
@@ -672,7 +774,7 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
     const lpBtn = await cyclePage.$('button.button-primary[type="submit"]');
     if (!lpBtn) {
       log("ERROR: LinkPays button not found on /earn.");
-      return { ok: false, cooldownSec: 0 };
+      return { ok: false, cooldownSec: 0, msUntilNextSlot: 0, usageToday: status.usageToday, usageMax: status.usageMax };
     }
     const btnText: string = await cyclePage.evaluate((el: any) => el.innerText, lpBtn).catch(() => "");
     log(`Clicking: "${btnText.trim()}"`);
@@ -709,10 +811,10 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
       const s2 = await getLinkPaysStatus(cyclePage);
       if (s2.cooldownSec > 0) {
         log(`Flash cooldown detected: ${s2.cooldownSec}s.`);
-        return { ok: false, cooldownSec: s2.cooldownSec };
+        return { ok: false, cooldownSec: s2.cooldownSec, msUntilNextSlot: 0, usageToday: s2.usageToday, usageMax: s2.usageMax };
       }
       log(`WARNING: Did not reach linkpays.in. Current tab: ${cyclePage.url()}`);
-      return { ok: false, cooldownSec: 60 };
+      return { ok: false, cooldownSec: 60, msUntilNextSlot: 0, usageToday: s2.usageToday, usageMax: s2.usageMax };
     }
 
     log(`Active page for ad chain: ${lpPage.url()}`);
@@ -812,11 +914,11 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
     if (alertMatch) log(`Alert on /earn: ${alertMatch[0].replace(/\s+/g, " ").slice(0, 300)}`);
 
     if (diff > 0) {
-      log(`✅ CYCLE ${cycleNum} SUCCESS — earned ${diff} coins`);
-      return { ok: true, cooldownSec: statusAfter.cooldownSec || 0 };
+      log(`✅ CYCLE ${cycleNum} SUCCESS — earned ${diff} coins | Usage: ${statusAfter.usageToday}/${statusAfter.usageMax}`);
+      return { ok: true, cooldownSec: statusAfter.cooldownSec || 0, msUntilNextSlot: statusAfter.msUntilNextSlot, usageToday: statusAfter.usageToday, usageMax: statusAfter.usageMax };
     } else {
-      log(`❌ CYCLE ${cycleNum} — No coins credited. Flash: "${statusAfter.flashMsg}"`);
-      return { ok: false, cooldownSec: statusAfter.cooldownSec || 0 };
+      log(`❌ CYCLE ${cycleNum} — No coins credited. Flash: "${statusAfter.flashMsg}" | Usage: ${statusAfter.usageToday}/${statusAfter.usageMax}`);
+      return { ok: false, cooldownSec: statusAfter.cooldownSec || 0, msUntilNextSlot: statusAfter.msUntilNextSlot, usageToday: statusAfter.usageToday, usageMax: statusAfter.usageMax };
     }
 
   } finally {
@@ -832,6 +934,17 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolea
 
 async function main() {
   log("═══ LINKPAYS RUNNER STARTING ═══");
+
+  // Render Web Services require a port listener or they show "No open ports" warnings.
+  // Spin up a minimal health-check server so Render considers the service healthy.
+  const healthPort = parseInt(process.env.PORT ?? "10000", 10);
+  createServer((_, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  }).listen(healthPort, "0.0.0.0", () => {
+    log(`Health-check server listening on port ${healthPort}`);
+  });
+
   const xvfb = await startXvfb();
   process.env.DISPLAY = DISPLAY_NUM;
 
@@ -870,34 +983,16 @@ async function main() {
 
   await login(page);
 
-  let cycleNum    = 0;
-  let successesThisDay = 0;
-  let dayStart    = Date.now();
+  let cycleNum = 0;
 
   while (true) {
-    // Reset daily counter
-    const nowMs = Date.now();
-    if (nowMs - dayStart > 24 * 60 * 60 * 1000) {
-      log("24h reset — resetting daily counter.");
-      successesThisDay = 0;
-      dayStart = nowMs;
-    }
-
-    if (successesThisDay >= MAX_DAILY_USES) {
-      const msUntilReset = 24 * 60 * 60 * 1000 - (nowMs - dayStart);
-      log(`Daily limit reached (${MAX_DAILY_USES} uses). Sleeping ${Math.round(msUntilReset / 1000 / 60)}min until reset.`);
-      await sleep(msUntilReset + 60_000);
-      successesThisDay = 0;
-      dayStart = Date.now();
-      continue;
-    }
-
     cycleNum++;
-    let cycleResult = { ok: false, cooldownSec: 0 };
+    let cycleResult = {
+      ok: false, cooldownSec: 0, msUntilNextSlot: 0, usageToday: 0, usageMax: 10,
+    };
+
     try {
       cycleResult = await runOneCycle(browser, cycleNum);
-      if (cycleResult.ok) successesThisDay++;
-      log(`Daily uses today: ${successesThisDay}/${MAX_DAILY_USES}`);
     } catch (err: any) {
       log(`CYCLE ${cycleNum} ERROR: ${err?.message ?? err}`);
       // Re-login if session appears dead
@@ -914,12 +1009,35 @@ async function main() {
       } catch {}
     }
 
-    // Use server-reported cooldown if available, otherwise fall back to default
-    const waitSec = cycleResult.cooldownSec > 0
-      ? cycleResult.cooldownSec + 15
-      : COOLDOWN_MS / 1000;
-    log(`Waiting ${waitSec}s cooldown before next cycle…`);
-    await sleep(waitSec * 1000);
+    // ── Decide how long to wait before the next cycle ─────────────────────
+    //
+    // Priority order:
+    //  1. Server says 24h limit hit AND gives us exact next-slot time → sleep until then
+    //  2. Server-reported per-cycle cooldown (data-expire-seconds) → sleep that + 15s
+    //  3. Default inter-cycle cooldown (310s)
+    //
+    // Using server-side data means restarts on Render pick up from the real
+    // current state rather than a reset local counter.
+
+    if (!cycleResult.ok && cycleResult.msUntilNextSlot > 0) {
+      // 24h limit: sleep until the server says the next slot opens, plus 2min buffer
+      const sleepMs = cycleResult.msUntilNextSlot + 2 * 60_000;
+      log(`24h limit (${cycleResult.usageToday}/${cycleResult.usageMax}). Sleeping ${Math.round(sleepMs / 60_000)}min until next slot…`);
+      // Tick every 10 min so logs show the runner is alive
+      const wakeAt = Date.now() + sleepMs;
+      while (Date.now() < wakeAt) {
+        const remMin = Math.round((wakeAt - Date.now()) / 60_000);
+        log(`  waiting for daily reset — ${remMin}min remaining…`);
+        await sleep(Math.min(10 * 60_000, wakeAt - Date.now()));
+      }
+      log("Daily reset reached — resuming.");
+    } else {
+      const waitSec = cycleResult.cooldownSec > 0
+        ? cycleResult.cooldownSec + 15
+        : COOLDOWN_MS / 1000;
+      log(`Waiting ${waitSec}s cooldown before next cycle…`);
+      await sleep(waitSec * 1000);
+    }
   }
 }
 

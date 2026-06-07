@@ -1,0 +1,1 @@
+- [page.evaluate named-fn __name bug](page-evaluate-named-fn.md) — esbuild/tsx injects __name() for any named binding inside evaluate; use only `for` loops and inline expressions, no `const fn = () =>` inside evaluate callbacks.
