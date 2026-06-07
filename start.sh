@@ -98,6 +98,11 @@ echo "[start.sh] Xvfb:     ${XVFB_PATH:-via xvfb-run}"
 export PORT="${PORT:-10000}"
 echo "[start.sh] Health-check port: $PORT"
 
+# ── Raise OS thread/process limits (esbuild Go runtime needs them) ────────────
+# errno=11 (EAGAIN) from pthread_create means ulimit -u is too low.
+ulimit -u unlimited 2>/dev/null || ulimit -u 65536 2>/dev/null || true
+ulimit -n 65536 2>/dev/null || true
+
 # ── Skip Puppeteer bundled-Chromium download ──────────────────────────────────
 export PUPPETEER_SKIP_DOWNLOAD=true
 export PUPPETEER_EXECUTABLE_PATH="$CHROMIUM_PATH"
