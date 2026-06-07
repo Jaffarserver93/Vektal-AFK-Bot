@@ -94,9 +94,9 @@ async function waitForCF(page: any, timeoutMs = 120_000) {
   log("[CF] Waiting for Cloudflare challenge to clear…");
   await page.waitForFunction(
     () =>
-      !document.title.toLowerCase().includes("just a moment") &&
-      !location.href.includes("challenge") &&
-      !location.href.includes("cf-"),
+      !(globalThis as any).document.title.toLowerCase().includes("just a moment") &&
+      !(globalThis as any).location.href.includes("challenge") &&
+      !(globalThis as any).location.href.includes("cf-"),
     { timeout: timeoutMs, polling: 2000 },
   ).catch(() => {
     log("[CF] Warning: challenge did not clear within timeout.");

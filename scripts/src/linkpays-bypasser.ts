@@ -531,16 +531,30 @@ async function main() {
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
   log("Launching browser...");
-  const sandboxArgs = IS_SNAP_CHROMIUM ? [] : ["--no-sandbox", "--disable-setuid-sandbox"];
+  // See linkpays-runner.ts runBot() for full explanation of snap/Xvfb strategy.
+  const commonArgs = [
+    "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
+    "--disable-extensions", "--no-first-run", "--no-default-browser-check",
+    "--window-size=1280,900",
+  ];
+  const launcherDefaults = [
+    "--disable-background-networking", "--disable-client-side-phishing-detection",
+    "--disable-default-apps", "--disable-hang-monitor", "--disable-popup-blocking",
+    "--disable-prompt-on-repost", "--disable-sync", "--metrics-recording-only",
+    "--safebrowsing-disable-auto-update", "--password-store=basic", "--use-mock-keychain",
+    "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
+  ];
+  const connectArgs = IS_SNAP_CHROMIUM
+    ? [...launcherDefaults, ...commonArgs]
+    : [...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"];
   const { browser: b, page } = await connect({
     headless: false,
-    args: [...sandboxArgs, "--disable-dev-shm-usage", "--disable-gpu",
-      "--disable-software-rasterizer", "--disable-extensions",
-      "--no-first-run", "--no-default-browser-check",
-      "--window-size=1280,900"],
+    args: connectArgs,
     customConfig: { chromePath: CHROMIUM_PATH },
     turnstile: true,
     connectOption: { defaultViewport: { width: 1280, height: 900 } },
+    disableXvfb: true,
+    ignoreAllFlags: IS_SNAP_CHROMIUM,
   } as any);
   browser = b;
   log("Browser launched.");

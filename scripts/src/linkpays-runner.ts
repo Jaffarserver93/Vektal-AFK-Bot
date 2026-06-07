@@ -141,8 +141,8 @@ async function waitForCF(page: any, ms = 120_000) {
   log("[CF] Waiting for Cloudflare challenge to clear…");
   await page.waitForFunction(
     () =>
-      !document.title.toLowerCase().includes("just a moment") &&
-      !location.href.includes("/cdn-cgi/challenge"),
+      !(globalThis as any).document.title.toLowerCase().includes("just a moment") &&
+      !(globalThis as any).location.href.includes("/cdn-cgi/challenge"),
     { timeout: ms, polling: 2000 },
   ).catch(() => {
     log("[CF] Warning: challenge did not clear within timeout — continuing anyway.");
@@ -1031,22 +1031,67 @@ async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
   try {
     log(`Launching browser… (chromium: ${CHROMIUM_PATH}, snap: ${IS_SNAP_CHROMIUM}, display: ${process.env.DISPLAY ?? "not set"})`);
 
-    // Snap Chromium manages its own sandbox — passing --no-sandbox causes an immediate crash.
-    // Non-snap/system Chromium on a headless server requires --no-sandbox.
-    const sandboxArgs = IS_SNAP_CHROMIUM
-      ? []
-      : ["--no-sandbox", "--disable-setuid-sandbox"];
+    // ── Chrome launch strategy ─────────────────────────────────────────────────
+    //
+    // puppeteer-real-browser hardcodes "--no-sandbox" into its default flag set
+    // unconditionally (lib/cjs/index.js line ~65).  For snap Chromium that flag
+    // causes an immediate crash (snap already provides its own confinement), so
+    // Chrome exits before binding its DevTools port → ECONNREFUSED.
+    //
+    // Fix: pass ignoreAllFlags:true for snap so the library builds its flag list
+    // purely from the args we supply, skipping the hardcoded --no-sandbox.
+    // For non-snap we let the library use its defaults (which include --no-sandbox)
+    // and only append our extras.
+    //
+    // disableXvfb:true is always set — we manage Xvfb ourselves (start.sh /
+    // startXvfb()), and puppeteer-real-browser's own Xvfb instance would clash
+    // with the existing display session.
+    //
+    // --disable-gpu is critical for Xvfb environments: without it Chrome's GPU
+    // process crashes and takes down the renderer, again preventing the DevTools
+    // port from opening.
+
+    // Common flags needed in all cases (Xvfb / headless server)
+    const commonArgs = [
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--window-size=1280,900",
+      "--no-first-run",
+      "--no-default-browser-check",
+    ];
+
+    // Flags that chrome-launcher's defaultFlags() normally supplies — we must
+    // include them manually when ignoreAllFlags:true (snap path).
+    const launcherDefaults = [
+      "--disable-background-networking",
+      "--disable-client-side-phishing-detection",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--disable-hang-monitor",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--safebrowsing-disable-auto-update",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      // Includes AutomationControlled in disable-features (same as the lib does)
+      "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
+    ];
+
+    const connectArgs = IS_SNAP_CHROMIUM
+      ? [...launcherDefaults, ...commonArgs]          // no --no-sandbox for snap
+      : [...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"];
 
     const { browser: b, page } = await connect({
       headless: false,
-      args: [
-        ...sandboxArgs,
-        "--disable-dev-shm-usage",
-        "--window-size=1280,900",
-      ],
+      args: connectArgs,
       customConfig: { chromePath: CHROMIUM_PATH },
       turnstile: true,
       connectOption: { defaultViewport: { width: 1280, height: 900 } },
+      disableXvfb: true,                              // we own the Xvfb session
+      ignoreAllFlags: IS_SNAP_CHROMIUM,               // snap: skip hardcoded --no-sandbox
     } as any);
     browser = b;
     log("Browser launched ✓");

@@ -19,6 +19,21 @@ const XVFB_PATH =
   "/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin/Xvfb";
 const DISPLAY_NUM = ":98";
 
+import { execSync } from "child_process";
+
+// Detect snap Chromium (same logic as linkpays-runner.ts)
+const IS_SNAP_CHROMIUM =
+  process.env.IS_SNAP_CHROMIUM === "true" ||
+  CHROMIUM_PATH.includes("/snap/") ||
+  (() => {
+    try {
+      const resolved = execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().trim();
+      if (resolved.includes("/snap/")) return true;
+      const head = execSync(`head -5 "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString();
+      return head.includes("/snap/");
+    } catch { return false; }
+  })();
+
 if (!EMAIL || !PASSWORD) {
   console.error("VEKTAL_EMAIL and VEKTAL_PASSWORD must be set");
   process.exit(1);
@@ -99,18 +114,30 @@ async function main() {
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
+  // See linkpays-runner.ts runBot() for full explanation of snap/Xvfb strategy.
+  const commonProbeArgs = [
+    "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
+    "--no-first-run", "--no-default-browser-check", "--window-size=1280,800",
+  ];
+  const launcherDefaultsProbe = [
+    "--disable-background-networking", "--disable-client-side-phishing-detection",
+    "--disable-default-apps", "--disable-extensions", "--disable-hang-monitor",
+    "--disable-popup-blocking", "--disable-prompt-on-repost", "--disable-sync",
+    "--metrics-recording-only", "--safebrowsing-disable-auto-update",
+    "--password-store=basic", "--use-mock-keychain",
+    "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
+  ];
+  const probeConnectArgs = IS_SNAP_CHROMIUM
+    ? [...launcherDefaultsProbe, ...commonProbeArgs]
+    : [...commonProbeArgs, "--no-sandbox", "--disable-setuid-sandbox"];
   const { browser: b, page } = await connect({
     headless: false,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--window-size=1280,800",
-    ],
+    args: probeConnectArgs,
     customConfig: { chromePath: CHROMIUM_PATH },
     turnstile: true,
     connectOption: { defaultViewport: { width: 1280, height: 800 } },
+    disableXvfb: true,
+    ignoreAllFlags: IS_SNAP_CHROMIUM,
   } as any);
   browser = b;
 
