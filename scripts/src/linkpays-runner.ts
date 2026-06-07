@@ -126,18 +126,26 @@ async function readCountdown(page: any): Promise<number> {
 /**
  * Wait until the countdown on the page reaches 0 (or disappears).
  * Polls every second, logs ticks every 5s.
+ * Also enforces a minimum floor wait so the ad server registers a real visit.
  */
-async function waitForCountdown(page: any, maxWaitMs = 45_000, label = "") {
+async function waitForCountdown(page: any, maxWaitMs = 45_000, label = "", minWaitMs = 15_000) {
   const prefix = label ? `[${label}] ` : "";
+  // Brief pause so page JS can initialize the timer before we first read it
+  await sleep(1500);
+
   const dl = Date.now() + maxWaitMs;
+  const minDeadline = Date.now() + minWaitMs;
   let last = -1;
+  let seen = false; // whether we ever saw a non-zero countdown
   while (Date.now() < dl) {
     const secs = await readCountdown(page);
     if (secs !== last) { log(`${prefix}Countdown: ${secs}s`); last = secs; }
-    if (secs <= 0) return;
+    if (secs > 0) seen = true;
+    if (secs <= 0 && Date.now() >= minDeadline) return;
     await sleep(1000);
   }
-  log(`${prefix}Countdown wait timed out — proceeding anyway.`);
+  if (!seen) log(`${prefix}Countdown never started — used minimum ${minWaitMs / 1000}s floor.`);
+  log(`${prefix}Countdown wait done.`);
 }
 
 /**
@@ -243,10 +251,14 @@ async function getCoins(page: any): Promise<number> {
 }
 
 async function getLinkPaysStatus(page: any): Promise<{
-  available: boolean; cooldownSec: number;
+  available: boolean; cooldownSec: number; flashMsg: string;
 }> {
   return page.evaluate(() => {
     const doc = (globalThis as any).document;
+    // Read flash/alert message from the page
+    const flashEl = doc.querySelector(".alert, .flash, [role='alert'], .notice");
+    const flashMsg: string = flashEl ? (flashEl.innerText ?? flashEl.textContent ?? "").trim() : "";
+
     const cards = Array.from(doc.querySelectorAll("article.offer-card"));
     let lpCard: any = null;
     for (const c of cards as any[]) {
@@ -256,7 +268,7 @@ async function getLinkPaysStatus(page: any): Promise<{
     if (!lpCard) {
       // Fallback: look for any submit button
       const btn = doc.querySelector('button.button-primary[type="submit"]');
-      return { available: !!btn && !(btn as any).disabled, cooldownSec: 0 };
+      return { available: !!btn && !(btn as any).disabled, cooldownSec: 0, flashMsg };
     }
     const btn = lpCard.querySelector("button.button-primary[type='submit']");
     const available = !!btn && !(btn as any).disabled;
@@ -264,8 +276,8 @@ async function getLinkPaysStatus(page: any): Promise<{
     const cooldownSec = expireEl
       ? parseInt((expireEl as any).getAttribute("data-expire-seconds") ?? "0", 10)
       : 0;
-    return { available, cooldownSec };
-  }).catch(() => ({ available: false, cooldownSec: 0 }));
+    return { available, cooldownSec, flashMsg };
+  }).catch(() => ({ available: false, cooldownSec: 0, flashMsg: "" }));
 }
 
 // ─── Ad-page flow (rank1st.in / savepe.in) ───────────────────────────────────
@@ -389,42 +401,129 @@ async function handleAdPage(page: any, label: string): Promise<void> {
 // ─── bookyourhotel.in handler ─────────────────────────────────────────────────
 //
 // Pattern: wait 30s countdown → click "Get Link" → wait for redirect back to linkpays.in
+//
+// chainStartMs: timestamp when LP button was clicked on /earn (used to delay
+// "Get Link" until 237s elapsed, so the linkpays.in→vektalnodes.in redirect
+// lands at 241-243s — safely over the 240s server-side minimum).
 
-async function handleBookyourhotel(page: any): Promise<void> {
+async function handleBookyourhotel(page: any, chainStartMs?: number): Promise<void> {
   log(`[bookyourhotel] Handling: ${page.url()}`);
   await waitForCF(page, 30_000);
 
-  log("[bookyourhotel] Waiting for 30s countdown…");
-  await waitForCountdown(page, 60_000, "bookyourhotel");
-  await sleep(1000);
-
-  await scrollToBottom(page);
-  await sleep(500);
-
-  log("[bookyourhotel] Clicking 'Get Link'…");
-  let clicked = false;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    clicked = await clickButton(
-      page,
-      [
-        "#get-link",
-        ".get-link",
-        "button[id*='link']",
-        "a[id*='link']",
-        "#getlink",
-        ".getlink",
-      ],
-      ["get link", "getlink", "get-link", "claim", "proceed"],
-      "bookyourhotel",
-    );
-    if (clicked) break;
-    await sleep(1500);
+  // Step A: handle the main /?link=… page (countdown + Get Link)
+  if (page.url().includes("bookyourhotel.in") && !page.url().includes("/disclaimer")) {
+    log("[bookyourhotel] Waiting for countdown…");
+    await waitForCountdown(page, 60_000, "bookyourhotel");
+    await sleep(1000);
     await scrollToBottom(page);
-  }
-  log(`[bookyourhotel] Get Link clicked: ${clicked}`);
+    await sleep(500);
 
-  // Wait for redirect back to linkpays.in
-  log("[bookyourhotel] Waiting for redirect to linkpays.in…");
+    // ── Pre-click timing pad ────────────────────────────────────────────────
+    // Ensure we click "Get Link" no earlier than 237s since chain start so that
+    // the automatic linkpays.in→vektalnodes.in redirect (~4s later) lands at
+    // 241s+, satisfying the 240s server-side minimum.
+    if (chainStartMs !== undefined) {
+      const PRE_CLICK_TARGET_MS = 237_000; // 245s minimum − ~8s for redirects
+      const elapsed = Date.now() - chainStartMs;
+      const padMs = PRE_CLICK_TARGET_MS - elapsed;
+      if (padMs > 0) {
+        log(`[bookyourhotel] Elapsed: ${Math.round(elapsed / 1000)}s — waiting ${Math.round(padMs / 1000)}s before Get Link to hit 237s mark…`);
+        const padEnd = Date.now() + padMs;
+        while (Date.now() < padEnd) {
+          await sleep(5000);
+          const rem = Math.round((padEnd - Date.now()) / 1000);
+          if (rem > 0) log(`[bookyourhotel] Pre-click pad: ${rem}s remaining…`);
+        }
+      } else {
+        log(`[bookyourhotel] Elapsed: ${Math.round(elapsed / 1000)}s — already past 237s mark, clicking now.`);
+      }
+    }
+
+    log("[bookyourhotel] Clicking 'Get Link'…");
+    let clicked = false;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      clicked = await clickButton(
+        page,
+        [
+          "#get-link",
+          ".get-link",
+          "button[id*='link']",
+          "a[id*='link']",
+          "#getlink",
+          ".getlink",
+          "a.btn",
+          "button.btn",
+        ],
+        ["get link", "getlink", "get-link", "claim", "proceed", "continue", "get"],
+        "bookyourhotel",
+      );
+      if (clicked) break;
+      await sleep(1500);
+      await scrollToBottom(page);
+    }
+    log(`[bookyourhotel] Get Link clicked: ${clicked}`);
+
+    // Wait for any navigation away from the landing page
+    const landingUrl = page.url();
+    for (let i = 0; i < 15; i++) {
+      await sleep(800);
+      if (page.url() !== landingUrl) { log(`[bookyourhotel] Redirected → ${page.url()}`); break; }
+    }
+  }
+
+  // Step B: if we landed on /disclaimer/, click Continue/Agree/Accept
+  if (page.url().includes("bookyourhotel.in")) {
+    const curUrl = page.url();
+    log(`[bookyourhotel] On: ${curUrl}`);
+
+    if (curUrl.includes("/disclaimer") || curUrl === "https://bookyourhotel.in/" || curUrl === "https://bookyourhotel.in") {
+      // Dump page HTML for debugging
+      const html: string = await page.content().catch(() => "");
+      const { writeFileSync } = await import("fs");
+      writeFileSync("/tmp/bookyourhotel-disclaimer.html", html, "utf8");
+      log(`[bookyourhotel] Disclaimer page captured (${html.length} chars) → /tmp/bookyourhotel-disclaimer.html`);
+
+      await waitForCF(page, 20_000);
+      await sleep(1000);
+      await scrollToBottom(page);
+
+      log("[bookyourhotel] Clicking Continue/Agree on disclaimer page…");
+      let disclaimerClicked = false;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        disclaimerClicked = await clickButton(
+          page,
+          [
+            "#continueBtn",
+            ".continue-btn",
+            "#proceed",
+            "a.btn-primary",
+            "button.btn-primary",
+            "a.btn",
+            "button.btn",
+            "a[href*='vektalnodes']",
+            "a[href*='linkpays']",
+          ],
+          ["continue", "agree", "accept", "proceed", "next", "get link", "claim", "ok"],
+          "bookyourhotel-disclaimer",
+        );
+        if (disclaimerClicked) break;
+        await sleep(1500);
+        await scrollToBottom(page);
+      }
+      log(`[bookyourhotel] Disclaimer button clicked: ${disclaimerClicked}`);
+
+      // Wait for navigation
+      const disclaimerUrl = page.url();
+      for (let i = 0; i < 15; i++) {
+        await sleep(1000);
+        const u = page.url();
+        if (u !== disclaimerUrl) { log(`[bookyourhotel] Disclaimer redirect → ${u}`); break; }
+      }
+    }
+  }
+
+  // Step C: wait for final redirect back to linkpays.in or vektalnodes.in
+  log("[bookyourhotel] Waiting for final redirect to linkpays.in/vektalnodes.in…");
   await waitForUrl(page, ["linkpays.in", "vektalnodes.in"], 30_000, "bookyourhotel").catch(err => {
     log(`[bookyourhotel] ${err.message}`);
   });
@@ -494,113 +593,238 @@ async function handleLinkpays(page: any): Promise<void> {
 }
 
 // ─── One full earn cycle ──────────────────────────────────────────────────────
+//
+// Opens a fresh browser tab for each cycle (same pattern as afk-bot.ts).
+// Also tracks new-tab creation: if the button click spawns a popup/new window,
+// we switch to that new tab as our active page.
 
-async function runOneCycle(page: any, cycleNum: number): Promise<boolean> {
+async function runOneCycle(browser: any, cycleNum: number): Promise<{ ok: boolean; cooldownSec: number }> {
   const SEP = "═".repeat(70);
   log(`\n${SEP}`);
   log(`CYCLE ${cycleNum} START`);
   log(SEP);
 
-  // Navigate to /earn
-  await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-  await waitForCF(page);
-  await sleep(1000);
-
-  const coinsBefore = await getCoins(page);
-  const status      = await getLinkPaysStatus(page);
-  log(`Coins: ${coinsBefore} | LP available: ${status.available} | Cooldown: ${status.cooldownSec}s`);
-
-  if (!status.available) {
-    if (status.cooldownSec > 0) {
-      const waitMs = (status.cooldownSec + 10) * 1000;
-      log(`Cooldown active: ${status.cooldownSec}s. Waiting ${Math.round(waitMs / 1000)}s…`);
-      await sleep(waitMs);
-      return false;
-    }
-    log("LP button not available and no cooldown — 24h limit or other block.");
-    return false;
-  }
-
-  // ── Step 1: Click the LinkPays button on /earn ────────────────────────────
-  log("Clicking LinkPays button on /earn…");
-  const lpBtn = await page.$('button.button-primary[type="submit"]');
-  if (!lpBtn) {
-    log("ERROR: LinkPays button not found on /earn. Retrying next cycle.");
-    return false;
-  }
-  const btnText: string = await page.evaluate((el: any) => el.innerText, lpBtn).catch(() => "");
-  log(`Clicking: "${btnText.trim()}"`);
-  await lpBtn.click();
-
-  // ── Step 2: Wait for linkpays.in ─────────────────────────────────────────
-  log("Waiting for linkpays.in…");
-  await waitForUrl(page, ["linkpays.in"], 30_000, "earn→linkpays");
-
-  // ── Step 3: Handle linkpays.in (click "Continue to next step") ────────────
-  await handleLinkpays(page);
-
-  // ── Step 4-7: Handle the 4 ad pages in sequence ───────────────────────────
-  //
-  // After linkpays.in we expect:
-  //   rank1st.in/?link=…
-  //   rank1st.in/<article>
-  //   savepe.in/<article-1>
-  //   savepe.in/<article-2>
-  //
-  // We don't hardcode the exact URLs — we just handle each page that matches
-  // the known ad-page domains until we reach bookyourhotel.in.
-
-  const AD_DOMAINS    = ["rank1st.in", "savepe.in"];
-  const FINAL_DOMAIN  = "bookyourhotel.in";
-  const MAX_AD_PAGES  = 6; // safety cap
-
-  for (let pageNum = 1; pageNum <= MAX_AD_PAGES; pageNum++) {
-    const currentUrl = page.url();
-    log(`Ad page ${pageNum}: ${currentUrl}`);
-
-    if (currentUrl.includes(FINAL_DOMAIN)) {
-      await handleBookyourhotel(page);
-      break;
-    }
-
-    if (AD_DOMAINS.some(d => currentUrl.includes(d))) {
-      await handleAdPage(page, `ad-${pageNum}`);
-      await sleep(500);
-      continue;
-    }
-
-    // Unexpected domain — wait a moment in case of in-flight redirect
-    log(`Unexpected URL "${currentUrl}" — waiting 3s for redirect…`);
-    await sleep(3000);
-
-    const nextUrl = page.url();
-    if (nextUrl === currentUrl) {
-      log("URL didn't change — attempting to continue anyway.");
-      break;
-    }
-  }
-
-  // ── Step 8: Wait for return to vektalnodes.in/earn ───────────────────────
-  log("Waiting for return to vektalnodes.in…");
-  await waitForUrl(page, ["vektalnodes.in"], 30_000, "return").catch(err => {
-    log(`Return wait: ${err.message}. Navigating to /earn manually…`);
+  // Open a fresh page for this cycle (inherits cookies from same browser ctx)
+  let cyclePage: any = await browser.newPage().catch(async () => {
+    // Fallback: get all pages and use the last one
+    const pages: any[] = await browser.pages().catch(() => []);
+    return pages[pages.length - 1] ?? null;
   });
-  if (!page.url().includes("vektalnodes.in")) {
-    await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await waitForCF(page);
-  }
+  if (!cyclePage) throw new Error("Could not open a page for this cycle.");
+  await cyclePage.setViewport({ width: 1280, height: 900 }).catch(() => {});
 
-  await sleep(2000);
-  const coinsAfter = await getCoins(page);
-  const diff       = coinsAfter - coinsBefore;
-  log(`Coins BEFORE: ${coinsBefore} | Coins AFTER: ${coinsAfter} | Diff: +${diff}`);
+  // Track new tabs opened during this cycle so we can follow them
+  let newTabPage: any = null;
+  const onNewTarget = async (target: any) => {
+    try {
+      const p = await target.page().catch(() => null);
+      if (p && p !== cyclePage) {
+        log(`[NEW TAB] ${target.url() || "?"}`);
+        newTabPage = p;
+        await p.setViewport({ width: 1280, height: 900 }).catch(() => {});
+      }
+    } catch {}
+  };
+  browser.on("targetcreated", onNewTarget);
 
-  if (diff > 0) {
-    log(`✅ CYCLE ${cycleNum} SUCCESS — earned ${diff} coins (${coinsBefore} → ${coinsAfter})`);
-    return true;
-  } else {
-    log(`❌ CYCLE ${cycleNum} — No coins credited this cycle.`);
-    return false;
+  /**
+   * Return the page that's currently "active" (the one furthest in the flow).
+   * If a new tab was opened and has moved away from vektalnodes.in, use it.
+   */
+  const activePage = (): any => {
+    if (newTabPage) {
+      try {
+        const u: string = newTabPage.url();
+        if (u && !u.startsWith("about:") && !u.includes("vektalnodes.in")) return newTabPage;
+      } catch {}
+    }
+    return cyclePage;
+  };
+
+  try {
+    // Navigate to /earn on the fresh tab
+    log("Navigating to /earn on fresh tab…");
+    await cyclePage.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await waitForCF(cyclePage);
+    await sleep(1500);
+
+    // Check if redirected to login (session expired)
+    if (cyclePage.url().includes("/login")) {
+      log("Session expired — aborting cycle. Re-login needed.");
+      return { ok: false, cooldownSec: 0 };
+    }
+
+    const coinsBefore = await getCoins(cyclePage);
+    const status      = await getLinkPaysStatus(cyclePage);
+    log(`Coins: ${coinsBefore} | LP available: ${status.available} | Cooldown: ${status.cooldownSec}s`);
+
+    if (!status.available) {
+      if (status.cooldownSec > 0) {
+        log(`Cooldown active: ${status.cooldownSec}s.`);
+        return { ok: false, cooldownSec: status.cooldownSec };
+      }
+      log("LP button not available — 24h limit or other block.");
+      return { ok: false, cooldownSec: 0 };
+    }
+
+    // ── Step 1: Click the LinkPays button ──────────────────────────────────
+    log("Clicking LinkPays button on /earn…");
+    const lpBtn = await cyclePage.$('button.button-primary[type="submit"]');
+    if (!lpBtn) {
+      log("ERROR: LinkPays button not found on /earn.");
+      return { ok: false, cooldownSec: 0 };
+    }
+    const btnText: string = await cyclePage.evaluate((el: any) => el.innerText, lpBtn).catch(() => "");
+    log(`Clicking: "${btnText.trim()}"`);
+    const chainStartMs = Date.now(); // track elapsed for 240s minimum
+    await lpBtn.click();
+
+    // ── Step 2: Wait for linkpays.in on current tab OR new tab ─────────────
+    log("Waiting for linkpays.in (same tab or new tab)…");
+    let lpPage: any = cyclePage; // will be updated if a new tab takes over
+    let onLinkpays = false;
+    for (let i = 0; i < 40 && !onLinkpays; i++) {
+      await sleep(800);
+      // Check current tab
+      if (cyclePage.url().includes("linkpays.in")) {
+        lpPage = cyclePage; onLinkpays = true; break;
+      }
+      // Check if new tab opened and navigated to linkpays.in
+      if (newTabPage) {
+        try {
+          const u: string = newTabPage.url();
+          if (u.includes("linkpays.in")) { lpPage = newTabPage; onLinkpays = true; break; }
+          if (u && !u.startsWith("about:") && !u.includes("vektalnodes.in")) {
+            // New tab is somewhere in the flow — use it
+            log(`New tab is at ${u} — switching to it.`);
+            lpPage = newTabPage; onLinkpays = true; break;
+          }
+        } catch {}
+      }
+      if (i % 5 === 4) log(`Still waiting for linkpays.in… (${cyclePage.url()})`);
+    }
+
+    if (!onLinkpays) {
+      // Check for cooldown flash message
+      const s2 = await getLinkPaysStatus(cyclePage);
+      if (s2.cooldownSec > 0) {
+        log(`Flash cooldown detected: ${s2.cooldownSec}s.`);
+        return { ok: false, cooldownSec: s2.cooldownSec };
+      }
+      log(`WARNING: Did not reach linkpays.in. Current tab: ${cyclePage.url()}`);
+      return { ok: false, cooldownSec: 60 };
+    }
+
+    log(`Active page for ad chain: ${lpPage.url()}`);
+
+    // ── Step 3: Handle linkpays.in ─────────────────────────────────────────
+    if (lpPage.url().includes("linkpays.in")) {
+      await handleLinkpays(lpPage);
+    }
+
+    // ── Step 4+: Ad page chain ─────────────────────────────────────────────
+    const DONE_DOMAINS  = ["vektalnodes.in"];
+    const FINAL_DOMAIN  = "bookyourhotel.in";
+    const SKIP_DOMAINS  = ["linkpays.in"];
+    const MAX_AD_PAGES  = 10;
+
+    for (let pageNum = 1; pageNum <= MAX_AD_PAGES; pageNum++) {
+      // Check both tabs; prefer the one furthest in the chain
+      if (newTabPage && newTabPage !== lpPage) {
+        try {
+          const ntUrl: string = newTabPage.url();
+          if (ntUrl && !ntUrl.startsWith("about:") && !ntUrl.includes("vektalnodes.in/earn") &&
+              !ntUrl.includes("linkpays.in")) {
+            log(`Switching active page to new tab: ${ntUrl}`);
+            lpPage = newTabPage;
+          }
+        } catch {}
+      }
+
+      const currentUrl: string = lpPage.url();
+      log(`Ad page ${pageNum}: ${currentUrl}`);
+
+      if (DONE_DOMAINS.some(d => currentUrl.includes(d))) {
+        log("Returned to vektalnodes.in — chain complete.");
+        break;
+      }
+      if (currentUrl.includes(FINAL_DOMAIN)) {
+        await handleBookyourhotel(lpPage, chainStartMs);
+        break;
+      }
+      if (SKIP_DOMAINS.some(d => currentUrl.includes(d))) {
+        log(`[ad-${pageNum}] linkpays.in pass-through — waiting for redirect…`);
+        const prev = currentUrl;
+        for (let i = 0; i < 10; i++) {
+          await sleep(1000);
+          if (lpPage.url() !== prev) { log(`Redirected → ${lpPage.url()}`); break; }
+        }
+        continue;
+      }
+      // Any other domain → standard ad page (countdown → IANR → Verify → Continue)
+      await handleAdPage(lpPage, `ad-${pageNum}`);
+      await sleep(500);
+    }
+
+    // ── Step 7.5: Safety-net wait ──────────────────────────────────────────
+    //
+    // The pre-click pad inside handleBookyourhotel already ensures the
+    // linkpays.in→vektalnodes.in redirect lands at 241s+.
+    // This 5s safety sleep just lets the server process the return before
+    // we do any further navigation.
+    {
+      const elapsed = Date.now() - chainStartMs;
+      log(`Chain elapsed: ${Math.round(elapsed / 1000)}s — safety sleep 5s…`);
+      await sleep(5000);
+    }
+
+    // ── Step 8: Return to /earn and check coins ────────────────────────────
+    log("Waiting for return to vektalnodes.in…");
+    await waitForUrl(lpPage, ["vektalnodes.in"], 30_000, "return").catch(err => {
+      log(`Return wait: ${err.message}. Navigating to /earn manually…`);
+    });
+
+    // Use whichever page landed on vektalnodes.in
+    let earnPage = lpPage.url().includes("vektalnodes.in") ? lpPage : cyclePage;
+
+    // Always do a fresh /earn load so coin count is up-to-date
+    log(`Navigating to /earn for final coin check (currently: ${earnPage.url()})…`);
+    await earnPage.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await waitForCF(earnPage);
+    await sleep(3000); // let server update
+
+    // Dump earn page HTML for debugging
+    const earnHtml: string = await earnPage.content().catch(() => "");
+    const { writeFileSync } = await import("fs");
+    writeFileSync("/tmp/linkpays-earn-after.html", earnHtml, "utf8");
+    log(`Earn page HTML saved (${earnHtml.length} chars) → /tmp/linkpays-earn-after.html`);
+
+    const coinsAfter  = await getCoins(earnPage);
+    const statusAfter = await getLinkPaysStatus(earnPage);
+    const diff        = coinsAfter - coinsBefore;
+    log(`Coins BEFORE: ${coinsBefore} | AFTER: ${coinsAfter} | Diff: +${diff}`);
+    log(`Flash: "${statusAfter.flashMsg}" | Cooldown: ${statusAfter.cooldownSec}s`);
+
+    // Check if flash mentions anything about credits
+    const flashLower = (statusAfter.flashMsg ?? "").toLowerCase();
+    const earnHtmlLower = earnHtml.toLowerCase();
+    const alertMatch = earnHtml.match(/<[^>]*(alert|flash|notice)[^>]*>[\s\S]{0,500}/i);
+    if (alertMatch) log(`Alert on /earn: ${alertMatch[0].replace(/\s+/g, " ").slice(0, 300)}`);
+
+    if (diff > 0) {
+      log(`✅ CYCLE ${cycleNum} SUCCESS — earned ${diff} coins`);
+      return { ok: true, cooldownSec: statusAfter.cooldownSec || 0 };
+    } else {
+      log(`❌ CYCLE ${cycleNum} — No coins credited. Flash: "${statusAfter.flashMsg}"`);
+      return { ok: false, cooldownSec: statusAfter.cooldownSec || 0 };
+    }
+
+  } finally {
+    browser.off("targetcreated", onNewTarget);
+    // Close the new tab if one was opened
+    try { if (newTabPage) await newTabPage.close(); } catch {}
+    // Close the cycle tab
+    try { await cyclePage.close(); } catch {}
   }
 }
 
@@ -669,21 +893,33 @@ async function main() {
     }
 
     cycleNum++;
+    let cycleResult = { ok: false, cooldownSec: 0 };
     try {
-      const ok = await runOneCycle(page, cycleNum);
-      if (ok) successesThisDay++;
+      cycleResult = await runOneCycle(browser, cycleNum);
+      if (cycleResult.ok) successesThisDay++;
       log(`Daily uses today: ${successesThisDay}/${MAX_DAILY_USES}`);
     } catch (err: any) {
       log(`CYCLE ${cycleNum} ERROR: ${err?.message ?? err}`);
-      // Try to recover by navigating back to /earn
+      // Re-login if session appears dead
       try {
-        await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await waitForCF(page);
+        const pages: any[] = await browser.pages().catch(() => []);
+        const anyPage = pages[0];
+        if (anyPage) {
+          const u: string = anyPage.url();
+          if (u.includes("/login") || !u.includes("vektalnodes.in")) {
+            log("Attempting re-login after error…");
+            await login(anyPage);
+          }
+        }
       } catch {}
     }
 
-    log(`Waiting ${COOLDOWN_MS / 1000}s cooldown before next cycle…`);
-    await sleep(COOLDOWN_MS);
+    // Use server-reported cooldown if available, otherwise fall back to default
+    const waitSec = cycleResult.cooldownSec > 0
+      ? cycleResult.cooldownSec + 15
+      : COOLDOWN_MS / 1000;
+    log(`Waiting ${waitSec}s cooldown before next cycle…`);
+    await sleep(waitSec * 1000);
   }
 }
 
