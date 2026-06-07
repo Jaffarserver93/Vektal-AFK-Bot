@@ -33,7 +33,11 @@ const IS_SNAP_CHROMIUM =
   CHROMIUM_PATH.includes("/snap/") ||
   (() => {
     try {
-      return execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().includes("/snap/");
+      const resolved = execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().trim();
+      if (resolved.includes("/snap/")) return true;
+      // Ubuntu 22.04+: /usr/bin/chromium-browser is a shell script wrapper — read it
+      const head = execSync(`head -5 "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString();
+      return head.includes("/snap/");
     } catch { return false; }
   })();
 

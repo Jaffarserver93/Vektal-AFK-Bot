@@ -66,6 +66,9 @@ echo "[start.sh] Chromium: $CHROMIUM_PATH"
 IS_SNAP_CHROMIUM=false
 if [ -e /snap/bin/chromium ] || readlink -f "$CHROMIUM_PATH" 2>/dev/null | grep -q snap; then
   IS_SNAP_CHROMIUM=true
+elif head -5 "$CHROMIUM_PATH" 2>/dev/null | grep -q '/snap/'; then
+  # Ubuntu 22.04+: /usr/bin/chromium-browser is a shell script wrapper for snap
+  IS_SNAP_CHROMIUM=true
 fi
 export IS_SNAP_CHROMIUM
 echo "[start.sh] Snap Chromium: $IS_SNAP_CHROMIUM"

@@ -1,3 +1,5 @@
 - [page.evaluate named-fn __name bug](page-evaluate-named-fn.md) — esbuild/tsx injects __name() for any named binding inside evaluate; use only `for` loops and inline expressions, no `const fn = () =>` inside evaluate callbacks.
 - [Render process self-restart pattern](render-self-restart.md) — bot must never let the Node process exit on recoverable errors; wrap bot logic in infinite retry loop inside main().
 - [msUntilNextSlot always-positive pitfall](msuuntilnextslot-pitfall.md) — the "Next slot opens in" pill is always present; guard 24h-limit sleep with usageToday >= usageMax, not just msUntilNextSlot > 0.
+- [CF challenge bypass via cookie persistence](cf-cookie-persistence.md) — save cf_clearance + session cookies after login; restore on restart → CF clears in <1s; reloading page during CF wait resets the challenge loop.
+- [Ubuntu snap Chromium detection](ubuntu-snap-chromium.md) — /usr/bin/chromium-browser is a shell script wrapper (not symlink); use head -5 on the binary to detect /snap/ references, not just readlink.

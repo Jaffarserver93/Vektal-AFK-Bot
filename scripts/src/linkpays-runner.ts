@@ -17,7 +17,7 @@
 
 import { connect } from "puppeteer-real-browser";
 import { spawn, execSync, type ChildProcess } from "child_process";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { createServer } from "http";
 
 const SITE         = "https://vektalnodes.in";
@@ -45,13 +45,18 @@ const IS_SNAP_CHROMIUM =
   CHROMIUM_PATH.includes("/snap/") ||
   (() => {
     try {
+      // Check if symlink resolves to snap
       const resolved = execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().trim();
-      return resolved.includes("/snap/");
+      if (resolved.includes("/snap/")) return true;
+      // Ubuntu 22.04+: /usr/bin/chromium-browser is a shell script wrapper — read it
+      const head = execSync(`head -5 "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString();
+      return head.includes("/snap/");
     } catch { return false; }
   })();
 const COOLDOWN_MS     = 310_000; // 310s > 300s server cooldown
 const MAX_DAILY_USES  = 10;
 const LOG_FILE        = "/tmp/linkpays-runner.log";
+const COOKIE_FILE     = "/tmp/vektal-cookies.json";
 
 if (!EMAIL || !PASSWORD) {
   console.error("[runner] VEKTAL_EMAIL and VEKTAL_PASSWORD must be set");
@@ -67,6 +72,42 @@ function log(msg: string) {
   try { appendFileSync(LOG_FILE, line + "\n"); } catch {}
 }
 async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Cookie persistence (avoids CF challenge on every browser restart) ─────────
+
+async function saveCookies(page: any) {
+  try {
+    const cookies = await page.cookies();
+    writeFileSync(COOKIE_FILE, JSON.stringify(cookies));
+    log(`[cookies] Saved ${cookies.length} cookies.`);
+  } catch (err: any) {
+    log(`[cookies] Save failed: ${err?.message}`);
+  }
+}
+
+async function tryRestoreSession(page: any): Promise<boolean> {
+  try {
+    if (!existsSync(COOKIE_FILE)) return false;
+    const cookies = JSON.parse(readFileSync(COOKIE_FILE, "utf8"));
+    if (!Array.isArray(cookies) || cookies.length === 0) return false;
+    await page.setCookie(...cookies);
+    log(`[cookies] Restored ${cookies.length} cookies — navigating to /earn…`);
+    await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    // Give CF a short window — valid session cookies usually bypass it quickly
+    await waitForCF(page, 30_000);
+    const url: string   = page.url();
+    const title: string = await page.title().catch(() => "");
+    if (!url.includes("/login") && title.toLowerCase().includes("earn")) {
+      log("[cookies] Session restored — skipping login ✓");
+      return true;
+    }
+    log(`[cookies] Session expired (url: ${url}) — falling back to fresh login.`);
+    return false;
+  } catch (err: any) {
+    log(`[cookies] Restore failed: ${err?.message} — falling back to fresh login.`);
+    return false;
+  }
+}
 
 function startXvfb(): Promise<ChildProcess | null> {
   // If DISPLAY is already set (e.g. by xvfb-run in start.sh), skip spawning
@@ -93,29 +134,23 @@ function startXvfb(): Promise<ChildProcess | null> {
   });
 }
 
-async function waitForCF(page: any, ms = 60_000) {
-  const dl = Date.now() + ms;
-  let iteration = 0;
-  while (Date.now() < dl) {
-    const title: string = await page.title().catch(() => "");
-    const url:   string = page.url();
-    if (
-      !title.toLowerCase().includes("just a moment") &&
-      !url.includes("/cdn-cgi/challenge")
-    ) return;
-    iteration++;
-    log(`CF challenge active ("${title}") — waiting 2s… [${iteration}]`);
-    // Every 15 iterations (~30s) reload the page — a fresh request often clears the challenge
-    if (iteration % 15 === 0 && Date.now() + 5_000 < dl) {
-      log("CF stuck — reloading page to get a fresh challenge…");
-      const currentUrl = page.url();
-      await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-      await sleep(3_000);
-    } else {
-      await sleep(2000);
-    }
+async function waitForCF(page: any, ms = 120_000) {
+  // Use waitForFunction so the check runs INSIDE the browser — no external
+  // polling that could trigger Cloudflare's bot heuristics.
+  // puppeteer-real-browser with turnstile:true handles the JS challenge automatically.
+  log("[CF] Waiting for Cloudflare challenge to clear…");
+  await page.waitForFunction(
+    () =>
+      !document.title.toLowerCase().includes("just a moment") &&
+      !location.href.includes("/cdn-cgi/challenge"),
+    { timeout: ms, polling: 2000 },
+  ).catch(() => {
+    log("[CF] Warning: challenge did not clear within timeout — continuing anyway.");
+  });
+  const title: string = await page.title().catch(() => "");
+  if (!title.toLowerCase().includes("just a moment")) {
+    log("[CF] Challenge cleared ✓");
   }
-  log("Warning: CF may not have cleared within timeout — continuing anyway.");
 }
 
 /**
@@ -241,8 +276,14 @@ async function scrollToBottom(page: any) {
 // ─── Login ────────────────────────────────────────────────────────────────────
 
 async function login(page: any) {
-  log("Navigating to /login…");
+  log("Navigating to homepage to warm up Cloudflare trust…");
+  // Visit the homepage first — CF evaluates a benign page before the login page.
+  // This significantly increases the chance of passing the managed JS challenge.
+  await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+  await waitForCF(page, 60_000);
+  await sleep(2_000);
 
+  log("Navigating to /login…");
   // Retry up to 3 times — Render's cold-start network can be slow on first request
   let navOk = false;
   for (let attempt = 1; attempt <= 3 && !navOk; attempt++) {
@@ -1001,16 +1042,6 @@ async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
       args: [
         ...sandboxArgs,
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-translate",
-        "--disable-sync",
-        "--disable-features=TranslateUI",
         "--window-size=1280,900",
       ],
       customConfig: { chromePath: CHROMIUM_PATH },
@@ -1026,7 +1057,13 @@ async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
         log(`[PAGE] ${t}`);
     });
 
-    await login(page);
+    // Try to restore a previous session (skips CF challenge on restart).
+    // Falls back to fresh login if cookies are missing or expired.
+    const restored = await tryRestoreSession(page);
+    if (!restored) {
+      await login(page);
+      await saveCookies(page);
+    }
 
     while (true) {
       cycleNumRef.n++;
@@ -1048,6 +1085,7 @@ async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
             if (u.includes("/login") || !u.includes("vektalnodes.in")) {
               log("Attempting re-login after error…");
               await login(anyPage);
+              await saveCookies(anyPage);
             }
           }
         } catch (loginErr: any) {

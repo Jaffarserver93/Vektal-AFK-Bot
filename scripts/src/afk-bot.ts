@@ -28,7 +28,10 @@ const IS_SNAP_CHROMIUM =
   (() => {
     try {
       const resolved = execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().trim();
-      return resolved.includes("/snap/");
+      if (resolved.includes("/snap/")) return true;
+      // Ubuntu 22.04+: /usr/bin/chromium-browser is a shell script wrapper — read it
+      const head = execSync(`head -5 "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString();
+      return head.includes("/snap/");
     } catch { return false; }
   })();
 
@@ -85,25 +88,31 @@ function startXvfb(): Promise<ChildProcess | null> {
   });
 }
 
-async function waitForCF(page: any, timeoutMs = 60_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const url: string = page.url();
-    const title: string = await page.title().catch(() => "");
-    if (
-      !title.toLowerCase().includes("just a moment") &&
-      !url.includes("challenge") &&
-      !url.includes("cf-")
-    ) {
-      return;
-    }
-    log(`CF challenge — "${title}" — waiting...`);
-    await sleep(2000);
+async function waitForCF(page: any, timeoutMs = 120_000) {
+  // Use waitForFunction so the check runs INSIDE the browser — no external
+  // polling that could trigger Cloudflare's bot heuristics.
+  log("[CF] Waiting for Cloudflare challenge to clear…");
+  await page.waitForFunction(
+    () =>
+      !document.title.toLowerCase().includes("just a moment") &&
+      !location.href.includes("challenge") &&
+      !location.href.includes("cf-"),
+    { timeout: timeoutMs, polling: 2000 },
+  ).catch(() => {
+    log("[CF] Warning: challenge did not clear within timeout.");
+  });
+  const title: string = await page.title().catch(() => "");
+  if (!title.toLowerCase().includes("just a moment")) {
+    log("[CF] Challenge cleared ✓");
   }
-  log("Warning: CF may not have cleared within timeout.");
 }
 
 async function login(page: any) {
+  log("Navigating to homepage to warm up Cloudflare trust…");
+  await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+  await waitForCF(page, 60_000);
+  await sleep(2_000);
+
   log(`Navigating to ${SITE}/login`);
   await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await waitForCF(page);
@@ -184,6 +193,10 @@ async function keepAlive(page: any) {
 
       const cookies = await page.cookies().catch(() => [] as any[]);
       log(`[tick ${tick}] session cookies: ${cookies.length}`);
+      // Share cookies with the runner so it can bypass CF on restart
+      if (cookies.length > 0) {
+        try { writeFileSync("/tmp/vektal-cookies.json", JSON.stringify(cookies)); } catch {}
+      }
     } catch (err: any) {
       log(`[tick ${tick}] Error during keep-alive: ${err.message}`);
     }
@@ -624,17 +637,7 @@ async function main() {
       args: [
         ...sandboxArgs,
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-translate",
-        "--disable-sync",
-        "--disable-features=TranslateUI",
-        "--window-size=1280,800",
+        "--window-size=1280,900",
       ],
       customConfig: {
         chromePath: CHROMIUM_PATH,
