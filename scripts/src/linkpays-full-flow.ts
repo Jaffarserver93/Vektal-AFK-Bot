@@ -10,18 +10,32 @@
  */
 
 import { connect } from "puppeteer-real-browser";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, execSync, type ChildProcess } from "child_process";
 
 const SITE = "https://vektalnodes.in";
 const EMAIL = process.env.VEKTAL_EMAIL ?? "";
 const PASSWORD = process.env.VEKTAL_PASSWORD ?? "";
 const CHROMIUM_PATH =
   process.env.CHROMIUM_PATH ??
-  "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium";
-const XVFB_PATH =
-  process.env.XVFB_PATH ??
-  "/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin/Xvfb";
+  process.env.PUPPETEER_EXECUTABLE_PATH ??
+  (() => {
+    try { const p = execSync("which chromium 2>/dev/null").toString().trim(); if (p) return p; } catch {}
+    try { const p = execSync("which chromium-browser 2>/dev/null").toString().trim(); if (p) return p; } catch {}
+    for (const c of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
+      try { execSync(`test -x ${c}`); return c; } catch {}
+    }
+    return "/usr/bin/chromium-browser";
+  })();
+const XVFB_PATH = process.env.XVFB_PATH ?? "/usr/bin/Xvfb";
 const DISPLAY_NUM = ":96";
+const IS_SNAP_CHROMIUM =
+  process.env.IS_SNAP_CHROMIUM === "true" ||
+  CHROMIUM_PATH.includes("/snap/") ||
+  (() => {
+    try {
+      return execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().includes("/snap/");
+    } catch { return false; }
+  })();
 
 const SEP = "═".repeat(80);
 const DIV = "─".repeat(70);
@@ -31,13 +45,19 @@ if (!EMAIL || !PASSWORD) { console.error("Missing credentials"); process.exit(1)
 function log(msg: string) { console.log(`[flow ${new Date().toISOString()}] ${msg}`); }
 async function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
-function startXvfb(): Promise<ChildProcess> {
+function startXvfb(): Promise<ChildProcess | null> {
+  if (process.env.DISPLAY) {
+    log(`[Xvfb] DISPLAY already set to ${process.env.DISPLAY} — skipping internal Xvfb spawn.`);
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
-    const xvfb = spawn(XVFB_PATH, [DISPLAY_NUM, "-screen", "0", "1280x900x24"], {
-      stdio: ["ignore", "ignore", "pipe"], detached: false,
-    });
+    const xvfb = spawn(
+      XVFB_PATH,
+      [DISPLAY_NUM, "-screen", "0", "1280x900x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+      { stdio: ["ignore", "ignore", "pipe"], detached: false },
+    );
     xvfb.on("error", reject);
-    setTimeout(() => resolve(xvfb), 1500);
+    setTimeout(() => resolve(xvfb), 2000);
   });
 }
 
@@ -107,16 +127,21 @@ async function login(page: any) {
 async function main() {
   log("=== FULL LINKPAYS FLOW PROBE ===");
   const xvfb = await startXvfb();
-  process.env.DISPLAY = DISPLAY_NUM;
+  if (!process.env.DISPLAY) process.env.DISPLAY = DISPLAY_NUM;
+  log(`DISPLAY=${process.env.DISPLAY} | chromium=${CHROMIUM_PATH} | snap=${IS_SNAP_CHROMIUM}`);
 
   let browser: any;
-  const cleanup = () => { try { browser?.close(); } catch {} xvfb.kill("SIGTERM"); };
+  const cleanup = () => { try { browser?.close(); } catch {} if (xvfb) xvfb.kill("SIGTERM"); };
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
+  const sandboxArgs = IS_SNAP_CHROMIUM ? [] : ["--no-sandbox", "--disable-setuid-sandbox"];
   const { browser: b, page: mainPage } = await connect({
     headless: false,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--window-size=1280,900"],
+    args: [...sandboxArgs, "--disable-dev-shm-usage", "--disable-gpu",
+      "--disable-software-rasterizer", "--disable-extensions",
+      "--no-first-run", "--no-default-browser-check",
+      "--window-size=1280,900"],
     customConfig: { chromePath: CHROMIUM_PATH },
     turnstile: true,
     connectOption: { defaultViewport: { width: 1280, height: 900 } },

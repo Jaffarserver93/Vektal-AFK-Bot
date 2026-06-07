@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# ─── LinkPays Runner — Ubuntu local start script ──────────────────────────────
+# ─── LinkPays Runner — Ubuntu start script ────────────────────────────────────
 # Usage:
 #   1. Copy .env.example → .env and fill in your values
-#   2. chmod +x start.sh
-#   3. ./start.sh
+#   2. chmod +x start.sh && ./start.sh
 #
-# First-time Ubuntu setup (run once):
+# One-time Ubuntu setup (run once as root/sudo):
 #   sudo apt-get update && sudo apt-get install -y \
-#     chromium-browser xvfb fonts-liberation \
+#     chromium-browser xvfb fonts-liberation xauth \
 #     libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 \
 #     libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 \
 #     libpango-1.0-0 libpangocairo-1.0-0 libx11-6 libx11-xcb1 libxcb1 \
@@ -45,8 +44,12 @@ fi
 
 # ── Detect Chromium path ──────────────────────────────────────────────────────
 if [ -z "${CHROMIUM_PATH:-}" ]; then
-  for candidate in /usr/bin/chromium-browser /usr/bin/chromium /usr/bin/google-chrome; do
-    if command -v "$candidate" &>/dev/null || [ -x "$candidate" ]; then
+  for candidate in \
+    /usr/bin/chromium \
+    /usr/bin/chromium-browser \
+    /usr/bin/google-chrome \
+    /usr/bin/google-chrome-stable; do
+    if [ -x "$candidate" ]; then
       export CHROMIUM_PATH="$candidate"
       break
     fi
@@ -59,7 +62,20 @@ if [ -z "${CHROMIUM_PATH:-}" ]; then
 fi
 echo "[start.sh] Chromium: $CHROMIUM_PATH"
 
-# ── Detect Xvfb path ─────────────────────────────────────────────────────────
+# ── Detect snap Chromium (cannot use --no-sandbox with snap) ──────────────────
+IS_SNAP_CHROMIUM=false
+if [ -e /snap/bin/chromium ] || readlink -f "$CHROMIUM_PATH" 2>/dev/null | grep -q snap; then
+  IS_SNAP_CHROMIUM=true
+fi
+export IS_SNAP_CHROMIUM
+echo "[start.sh] Snap Chromium: $IS_SNAP_CHROMIUM"
+
+# ── Detect Xvfb ───────────────────────────────────────────────────────────────
+XVFB_RUN_CMD=""
+if command -v xvfb-run &>/dev/null; then
+  XVFB_RUN_CMD="xvfb-run"
+fi
+
 if [ -z "${XVFB_PATH:-}" ]; then
   for candidate in /usr/bin/Xvfb /usr/local/bin/Xvfb; do
     if [ -x "$candidate" ]; then
@@ -68,12 +84,12 @@ if [ -z "${XVFB_PATH:-}" ]; then
     fi
   done
 fi
-if [ -z "${XVFB_PATH:-}" ]; then
+if [ -z "${XVFB_PATH:-}" ] && [ -z "$XVFB_RUN_CMD" ]; then
   echo "[start.sh] ERROR: Xvfb not found. Install it:"
   echo "           sudo apt-get install -y xvfb"
   exit 1
 fi
-echo "[start.sh] Xvfb:     $XVFB_PATH"
+echo "[start.sh] Xvfb:     ${XVFB_PATH:-via xvfb-run}"
 
 # ── Port ─────────────────────────────────────────────────────────────────────
 export PORT="${PORT:-10000}"
@@ -81,8 +97,23 @@ echo "[start.sh] Health-check port: $PORT"
 
 # ── Skip Puppeteer bundled-Chromium download ──────────────────────────────────
 export PUPPETEER_SKIP_DOWNLOAD=true
+export PUPPETEER_EXECUTABLE_PATH="$CHROMIUM_PATH"
 export NODE_ENV="${NODE_ENV:-production}"
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+# ── Kill any stale Xvfb on display :94 ────────────────────────────────────────
+pkill -f "Xvfb :94" 2>/dev/null || true
+sleep 0.5
+
+# ── Run via xvfb-run (most reliable on Ubuntu) ────────────────────────────────
 echo "[start.sh] Starting runner…"
-exec pnpm --filter @workspace/scripts run linkpays-runner
+
+if [ -n "$XVFB_RUN_CMD" ]; then
+  # xvfb-run sets DISPLAY automatically and manages Xvfb lifecycle
+  exec xvfb-run \
+    --server-num=94 \
+    --server-args="-screen 0 1280x900x24 -ac +extension GLX +render -noreset" \
+    pnpm --filter @workspace/scripts run linkpays-runner
+else
+  # Fallback: let the runner manage Xvfb itself
+  exec pnpm --filter @workspace/scripts run linkpays-runner
+fi

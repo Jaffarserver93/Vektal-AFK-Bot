@@ -16,7 +16,7 @@
  */
 
 import { connect } from "puppeteer-real-browser";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, execSync, type ChildProcess } from "child_process";
 import { appendFileSync } from "fs";
 import { createServer } from "http";
 
@@ -25,11 +25,30 @@ const EMAIL        = process.env.VEKTAL_EMAIL    ?? "";
 const PASSWORD     = process.env.VEKTAL_PASSWORD ?? "";
 const CHROMIUM_PATH =
   process.env.CHROMIUM_PATH ??
-  "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium";
+  process.env.PUPPETEER_EXECUTABLE_PATH ??
+  (() => {
+    try { const p = execSync("which chromium 2>/dev/null").toString().trim(); if (p) return p; } catch {}
+    try { const p = execSync("which chromium-browser 2>/dev/null").toString().trim(); if (p) return p; } catch {}
+    for (const c of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
+      try { execSync(`test -x ${c}`); return c; } catch {}
+    }
+    return "/usr/bin/chromium-browser";
+  })();
 const XVFB_PATH =
   process.env.XVFB_PATH ??
-  "/nix/store/sx3d9r61bi7xpg1vjiyvbay99634i282-xorg-server-21.1.18/bin/Xvfb";
+  "/usr/bin/Xvfb";
 const DISPLAY_NUM     = ":94";
+
+// Detect snap Chromium — snap packages must NOT receive --no-sandbox
+const IS_SNAP_CHROMIUM =
+  process.env.IS_SNAP_CHROMIUM === "true" ||
+  CHROMIUM_PATH.includes("/snap/") ||
+  (() => {
+    try {
+      const resolved = execSync(`readlink -f "${CHROMIUM_PATH}" 2>/dev/null || echo ""`).toString().trim();
+      return resolved.includes("/snap/");
+    } catch { return false; }
+  })();
 const COOLDOWN_MS     = 310_000; // 310s > 300s server cooldown
 const MAX_DAILY_USES  = 10;
 const LOG_FILE        = "/tmp/linkpays-runner.log";
@@ -49,17 +68,28 @@ function log(msg: string) {
 }
 async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
-function startXvfb(): Promise<ChildProcess> {
+function startXvfb(): Promise<ChildProcess | null> {
+  // If DISPLAY is already set (e.g. by xvfb-run in start.sh), skip spawning
+  if (process.env.DISPLAY) {
+    log(`[Xvfb] DISPLAY already set to ${process.env.DISPLAY} — skipping internal Xvfb spawn.`);
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
-    const xvfb = spawn(XVFB_PATH, [DISPLAY_NUM, "-screen", "0", "1280x900x24"], {
-      stdio: ["ignore", "ignore", "pipe"], detached: false,
-    });
+    log(`[Xvfb] Spawning ${XVFB_PATH} on display ${DISPLAY_NUM}…`);
+    const xvfb = spawn(
+      XVFB_PATH,
+      [DISPLAY_NUM, "-screen", "0", "1280x900x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+      { stdio: ["ignore", "ignore", "pipe"], detached: false },
+    );
     xvfb.stderr?.on("data", (d: Buffer) => {
       const l = d.toString().trim();
       if (l) log(`[Xvfb] ${l}`);
     });
-    xvfb.on("error", reject);
-    setTimeout(() => resolve(xvfb), 1500);
+    xvfb.on("error", (err) => {
+      log(`[Xvfb] ERROR: ${err.message} — if this is Ubuntu, ensure xvfb is installed: sudo apt-get install -y xvfb`);
+      reject(err);
+    });
+    setTimeout(() => resolve(xvfb), 2000);
   });
 }
 
@@ -955,17 +985,32 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
 // Extracted so main() can restart it on any fatal error without exiting the
 // Node process — Render must never see the process die on a recoverable error.
 
-async function runBot(xvfb: ChildProcess, cycleNumRef: { n: number }) {
+async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
   let browser: any;
   try {
-    log("Launching browser…");
+    log(`Launching browser… (chromium: ${CHROMIUM_PATH}, snap: ${IS_SNAP_CHROMIUM}, display: ${process.env.DISPLAY ?? "not set"})`);
+
+    // Snap Chromium manages its own sandbox — passing --no-sandbox causes an immediate crash.
+    // Non-snap/system Chromium on a headless server requires --no-sandbox.
+    const sandboxArgs = IS_SNAP_CHROMIUM
+      ? []
+      : ["--no-sandbox", "--disable-setuid-sandbox"];
+
     const { browser: b, page } = await connect({
       headless: false,
       args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
+        ...sandboxArgs,
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-translate",
+        "--disable-sync",
+        "--disable-features=TranslateUI",
         "--window-size=1280,900",
       ],
       customConfig: { chromePath: CHROMIUM_PATH },
@@ -1044,7 +1089,9 @@ async function main() {
   log("═══ LINKPAYS RUNNER STARTING ═══");
 
   // Render requires a bound port — spin up a minimal health-check server.
-  const healthPort = parseInt(process.env.PORT ?? "10000", 10);
+  // PORT=5000 is reserved for the API server on Replit. Fall back to 10000.
+  const rawPort = parseInt(process.env.PORT ?? "10000", 10);
+  const healthPort = rawPort === 5000 ? 10000 : rawPort;
   createServer((_, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ok");
@@ -1053,14 +1100,18 @@ async function main() {
   });
 
   const xvfb = await startXvfb();
-  process.env.DISPLAY = DISPLAY_NUM;
+  // Only set DISPLAY if not already provided (xvfb-run sets it automatically)
+  if (!process.env.DISPLAY) {
+    process.env.DISPLAY = DISPLAY_NUM;
+  }
+  log(`DISPLAY=${process.env.DISPLAY} | chromium=${CHROMIUM_PATH} | snap=${IS_SNAP_CHROMIUM}`);
 
   // Only exit on intentional signals — every other error restarts the bot session.
   let stopping = false;
   const onStop = () => {
     stopping = true;
     log("Stop signal received — shutting down.");
-    xvfb.kill("SIGTERM");
+    if (xvfb) xvfb.kill("SIGTERM");
     process.exit(0);
   };
   process.on("SIGINT",  onStop);
