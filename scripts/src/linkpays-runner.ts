@@ -65,6 +65,7 @@ function startXvfb(): Promise<ChildProcess> {
 
 async function waitForCF(page: any, ms = 60_000) {
   const dl = Date.now() + ms;
+  let iteration = 0;
   while (Date.now() < dl) {
     const title: string = await page.title().catch(() => "");
     const url:   string = page.url();
@@ -72,10 +73,19 @@ async function waitForCF(page: any, ms = 60_000) {
       !title.toLowerCase().includes("just a moment") &&
       !url.includes("/cdn-cgi/challenge")
     ) return;
-    log(`CF challenge active ("${title}") — waiting 2s…`);
-    await sleep(2000);
+    iteration++;
+    log(`CF challenge active ("${title}") — waiting 2s… [${iteration}]`);
+    // Every 15 iterations (~30s) reload the page — a fresh request often clears the challenge
+    if (iteration % 15 === 0 && Date.now() + 5_000 < dl) {
+      log("CF stuck — reloading page to get a fresh challenge…");
+      const currentUrl = page.url();
+      await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await sleep(3_000);
+    } else {
+      await sleep(2000);
+    }
   }
-  log("Warning: CF may not have cleared within timeout.");
+  log("Warning: CF may not have cleared within timeout — continuing anyway.");
 }
 
 /**
@@ -319,22 +329,29 @@ async function getLinkPaysStatus(page: any): Promise<{
                   ?? lpCard.querySelector("button[type='submit']");
     const available = !!btn && !btn.disabled;
 
-    // Active-session countdown (data-expire-seconds on timer element)
-    const expireEl: any = lpCard.querySelector("[data-expire-seconds]");
-    const cooldownSec = expireEl
-      ? parseInt(expireEl.getAttribute("data-expire-seconds") ?? "0", 10)
-      : 0;
-
-    // Parse "24h usage: X / Y" from .status-pill elements (use textContent, not innerText)
+    // Parse all .status-pill texts first — used for cooldown, usage, and next-slot
     let usageToday = 0;
     let usageMax   = 10;
+    let cooldownSec = 0;
     const pillEls: any[] = Array.from(lpCard.querySelectorAll(".status-pill"));
     let pillTexts = "";
     for (let pi = 0; pi < pillEls.length; pi++) {
       const t = ((pillEls[pi].textContent ?? pillEls[pi].innerText ?? "") as string).trim();
       pillTexts += (pi ? "|" : "") + t;
+      // "24h usage: X / Y"
       const mu = t.match(/24h usage:\s*(\d+)\s*\/\s*(\d+)/i);
       if (mu) { usageToday = parseInt(mu[1]); usageMax = parseInt(mu[2]); }
+      // "Cooldown: Xs" or "Cooldown: Xm Ys"
+      const mc = t.match(/^cooldown:\s*(\d+)s$/i);
+      if (mc) cooldownSec = parseInt(mc[1]);
+    }
+    // Also check data-expire-seconds attribute as fallback
+    if (!cooldownSec) {
+      const expireEl: any = lpCard.querySelector("[data-expire-seconds]");
+      if (expireEl) {
+        const v = parseInt(expireEl.getAttribute("data-expire-seconds") ?? "0", 10);
+        if (v > 0) cooldownSec = v;
+      }
     }
 
     // Parse "Next slot opens in Xh Xm" from pills or paragraphs
@@ -753,7 +770,7 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
 
     const coinsBefore = await getCoins(cyclePage);
     const status      = await getLinkPaysStatus(cyclePage);
-    log(`Coins: ${coinsBefore} | LP available: ${status.available} | Cooldown: ${status.cooldownSec}s | Usage: ${status.usageToday}/${status.usageMax} | dbg: ${(status as any)._dbg}`);
+    log(`Coins: ${coinsBefore} | LP available: ${status.available} | Session: ${status.cooldownSec > 0 ? status.cooldownSec + "s" : "none"} | Usage: ${status.usageToday}/${status.usageMax} | dbg: ${(status as any)._dbg}`);
 
     if (!status.available) {
       if (status.cooldownSec > 0) {
@@ -905,7 +922,10 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
     const statusAfter = await getLinkPaysStatus(earnPage);
     const diff        = coinsAfter - coinsBefore;
     log(`Coins BEFORE: ${coinsBefore} | AFTER: ${coinsAfter} | Diff: +${diff}`);
-    log(`Flash: "${statusAfter.flashMsg}" | Cooldown: ${statusAfter.cooldownSec}s`);
+    const nextWaitSec = statusAfter.cooldownSec > 0
+      ? statusAfter.cooldownSec + 15
+      : COOLDOWN_MS / 1000;
+    log(`Flash: "${statusAfter.flashMsg}" | Next wait: ${nextWaitSec}s${statusAfter.cooldownSec > 0 ? " (server)" : " (default)"}`);
 
     // Check if flash mentions anything about credits
     const flashLower = (statusAfter.flashMsg ?? "").toLowerCase();
@@ -930,13 +950,99 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
   }
 }
 
-// ─── Main loop ─────────────────────────────────────────────────────────────────
+// ─── Bot session (browser launch → login → cycle loop) ────────────────────────
+//
+// Extracted so main() can restart it on any fatal error without exiting the
+// Node process — Render must never see the process die on a recoverable error.
+
+async function runBot(xvfb: ChildProcess, cycleNumRef: { n: number }) {
+  let browser: any;
+  try {
+    log("Launching browser…");
+    const { browser: b, page } = await connect({
+      headless: false,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1280,900",
+      ],
+      customConfig: { chromePath: CHROMIUM_PATH },
+      turnstile: true,
+      connectOption: { defaultViewport: { width: 1280, height: 900 } },
+    } as any);
+    browser = b;
+    log("Browser launched ✓");
+
+    page.on("console", (msg: any) => {
+      const t = msg.text();
+      if (t.startsWith("[FETCH") || t.startsWith("[XHR") || t.includes("vektalnodes") || t.includes("earn"))
+        log(`[PAGE] ${t}`);
+    });
+
+    await login(page);
+
+    while (true) {
+      cycleNumRef.n++;
+      const cycleNum = cycleNumRef.n;
+      let cycleResult = {
+        ok: false, cooldownSec: 0, msUntilNextSlot: 0, usageToday: 0, usageMax: 10,
+      };
+
+      try {
+        cycleResult = await runOneCycle(browser, cycleNum);
+      } catch (err: any) {
+        log(`CYCLE ${cycleNum} ERROR: ${err?.message ?? err}`);
+        // Re-login if session appears dead
+        try {
+          const pages: any[] = await browser.pages().catch(() => []);
+          const anyPage = pages[0];
+          if (anyPage) {
+            const u: string = anyPage.url();
+            if (u.includes("/login") || !u.includes("vektalnodes.in")) {
+              log("Attempting re-login after error…");
+              await login(anyPage);
+            }
+          }
+        } catch (loginErr: any) {
+          log(`Re-login failed: ${loginErr?.message ?? loginErr} — will restart browser.`);
+          throw loginErr; // bubble up to trigger browser restart
+        }
+      }
+
+      // ── Decide how long to wait before the next cycle ─────────────────────
+      // Only use server next-slot time when the daily limit is truly exhausted.
+      // msUntilNextSlot is always >0 (rolling timer pill), so we must also check usage.
+      if (!cycleResult.ok && cycleResult.usageToday >= cycleResult.usageMax && cycleResult.msUntilNextSlot > 0) {
+        const sleepMs = cycleResult.msUntilNextSlot + 2 * 60_000;
+        log(`24h limit (${cycleResult.usageToday}/${cycleResult.usageMax}). Sleeping ${Math.round(sleepMs / 60_000)}min until next slot…`);
+        const wakeAt = Date.now() + sleepMs;
+        while (Date.now() < wakeAt) {
+          const remMin = Math.round((wakeAt - Date.now()) / 60_000);
+          log(`  waiting for daily reset — ${remMin}min remaining…`);
+          await sleep(Math.min(10 * 60_000, wakeAt - Date.now()));
+        }
+        log("Daily reset reached — resuming.");
+      } else {
+        const waitSec = cycleResult.cooldownSec > 0
+          ? cycleResult.cooldownSec + 15
+          : COOLDOWN_MS / 1000;
+        log(`Waiting ${waitSec}s cooldown before next cycle…`);
+        await sleep(waitSec * 1000);
+      }
+    }
+  } finally {
+    try { browser?.close(); } catch {}
+  }
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
   log("═══ LINKPAYS RUNNER STARTING ═══");
 
-  // Render Web Services require a port listener or they show "No open ports" warnings.
-  // Spin up a minimal health-check server so Render considers the service healthy.
+  // Render requires a bound port — spin up a minimal health-check server.
   const healthPort = parseInt(process.env.PORT ?? "10000", 10);
   createServer((_, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -948,95 +1054,28 @@ async function main() {
   const xvfb = await startXvfb();
   process.env.DISPLAY = DISPLAY_NUM;
 
-  let browser: any;
-  const cleanup = () => {
-    log("Cleaning up…");
-    try { browser?.close(); } catch {}
+  // Only exit on intentional signals — every other error restarts the bot session.
+  let stopping = false;
+  const onStop = () => {
+    stopping = true;
+    log("Stop signal received — shutting down.");
     xvfb.kill("SIGTERM");
+    process.exit(0);
   };
-  process.on("SIGINT",  () => { cleanup(); process.exit(0); });
-  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+  process.on("SIGINT",  onStop);
+  process.on("SIGTERM", onStop);
 
-  log("Launching browser…");
-  const { browser: b, page } = await connect({
-    headless: false,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--window-size=1280,900",
-    ],
-    customConfig: { chromePath: CHROMIUM_PATH },
-    turnstile: true,
-    connectOption: { defaultViewport: { width: 1280, height: 900 } },
-  } as any);
-  browser = b;
-  log("Browser launched ✓");
+  // Cycle counter persists across browser restarts so logs are sequential.
+  const cycleNumRef = { n: 0 };
 
-  // Log browser console output
-  page.on("console", (msg: any) => {
-    const t = msg.text();
-    if (t.startsWith("[FETCH") || t.startsWith("[XHR") || t.includes("vektalnodes") || t.includes("earn"))
-      log(`[PAGE] ${t}`);
-  });
-
-  await login(page);
-
-  let cycleNum = 0;
-
-  while (true) {
-    cycleNum++;
-    let cycleResult = {
-      ok: false, cooldownSec: 0, msUntilNextSlot: 0, usageToday: 0, usageMax: 10,
-    };
-
+  // Infinite self-restart loop — Render must never see this process die.
+  while (!stopping) {
     try {
-      cycleResult = await runOneCycle(browser, cycleNum);
+      await runBot(xvfb, cycleNumRef);
     } catch (err: any) {
-      log(`CYCLE ${cycleNum} ERROR: ${err?.message ?? err}`);
-      // Re-login if session appears dead
-      try {
-        const pages: any[] = await browser.pages().catch(() => []);
-        const anyPage = pages[0];
-        if (anyPage) {
-          const u: string = anyPage.url();
-          if (u.includes("/login") || !u.includes("vektalnodes.in")) {
-            log("Attempting re-login after error…");
-            await login(anyPage);
-          }
-        }
-      } catch {}
-    }
-
-    // ── Decide how long to wait before the next cycle ─────────────────────
-    //
-    // Priority order:
-    //  1. Server says 24h limit hit AND gives us exact next-slot time → sleep until then
-    //  2. Server-reported per-cycle cooldown (data-expire-seconds) → sleep that + 15s
-    //  3. Default inter-cycle cooldown (310s)
-    //
-    // Using server-side data means restarts on Render pick up from the real
-    // current state rather than a reset local counter.
-
-    if (!cycleResult.ok && cycleResult.msUntilNextSlot > 0) {
-      // 24h limit: sleep until the server says the next slot opens, plus 2min buffer
-      const sleepMs = cycleResult.msUntilNextSlot + 2 * 60_000;
-      log(`24h limit (${cycleResult.usageToday}/${cycleResult.usageMax}). Sleeping ${Math.round(sleepMs / 60_000)}min until next slot…`);
-      // Tick every 10 min so logs show the runner is alive
-      const wakeAt = Date.now() + sleepMs;
-      while (Date.now() < wakeAt) {
-        const remMin = Math.round((wakeAt - Date.now()) / 60_000);
-        log(`  waiting for daily reset — ${remMin}min remaining…`);
-        await sleep(Math.min(10 * 60_000, wakeAt - Date.now()));
-      }
-      log("Daily reset reached — resuming.");
-    } else {
-      const waitSec = cycleResult.cooldownSec > 0
-        ? cycleResult.cooldownSec + 15
-        : COOLDOWN_MS / 1000;
-      log(`Waiting ${waitSec}s cooldown before next cycle…`);
-      await sleep(waitSec * 1000);
+      log(`Bot session crashed: ${err?.message ?? err}`);
+      log("Restarting bot session in 30s…");
+      await sleep(30_000);
     }
   }
 }

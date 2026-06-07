@@ -1,1 +1,3 @@
 - [page.evaluate named-fn __name bug](page-evaluate-named-fn.md) — esbuild/tsx injects __name() for any named binding inside evaluate; use only `for` loops and inline expressions, no `const fn = () =>` inside evaluate callbacks.
+- [Render process self-restart pattern](render-self-restart.md) — bot must never let the Node process exit on recoverable errors; wrap bot logic in infinite retry loop inside main().
+- [msUntilNextSlot always-positive pitfall](msuuntilnextslot-pitfall.md) — the "Next slot opens in" pill is always present; guard 24h-limit sleep with usageToday >= usageMax, not just msUntilNextSlot > 0.
