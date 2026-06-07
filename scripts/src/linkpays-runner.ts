@@ -39,7 +39,8 @@ const XVFB_PATH =
   "/usr/bin/Xvfb";
 const DISPLAY_NUM     = ":94";
 
-// Detect snap Chromium — snap packages must NOT receive --no-sandbox
+// Detect snap Chromium — snap provides its OWN confinement; Chrome's internal
+// sandbox (--no-sandbox) is separate and still required when running as root.
 const IS_SNAP_CHROMIUM =
   process.env.IS_SNAP_CHROMIUM === "true" ||
   CHROMIUM_PATH.includes("/snap/") ||
@@ -1099,8 +1100,12 @@ async function runBot(xvfb: ChildProcess | null, cycleNumRef: { n: number }) {
       "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
     ];
 
+    // Snap Chromium still needs --no-sandbox when running as root (Chrome refuses
+    // to start as root without it, exiting before binding the DevTools port).
+    // Snap's OWN confinement is separate from Chrome's internal sandbox — we disable
+    // Chrome's internal sandbox via --no-sandbox while snap still provides security.
     const connectArgs = IS_SNAP_CHROMIUM
-      ? [...launcherDefaults, ...commonArgs]          // no --no-sandbox for snap
+      ? [...launcherDefaults, ...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"]
       : [...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"];
 
     const { browser: b, page } = await connect({

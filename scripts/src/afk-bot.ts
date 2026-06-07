@@ -628,9 +628,7 @@ async function main() {
   try {
     log(`Launching browser… (chromium: ${CHROMIUM_PATH}, snap: ${IS_SNAP_CHROMIUM}, display: ${process.env.DISPLAY ?? "not set"})`);
 
-    const sandboxArgs = IS_SNAP_CHROMIUM
-      ? []
-      : ["--no-sandbox", "--disable-setuid-sandbox"];
+    const sandboxArgs = ["--no-sandbox", "--disable-setuid-sandbox"];
 
     const result = await connect({
       headless: false,

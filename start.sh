@@ -62,7 +62,9 @@ if [ -z "${CHROMIUM_PATH:-}" ]; then
 fi
 echo "[start.sh] Chromium: $CHROMIUM_PATH"
 
-# ── Detect snap Chromium (cannot use --no-sandbox with snap) ──────────────────
+# ── Detect snap Chromium ──────────────────────────────────────────────────────
+# snap provides its own confinement; Chrome's internal sandbox is separate.
+# --no-sandbox is still required when running as root.
 IS_SNAP_CHROMIUM=false
 if [ -e /snap/bin/chromium ] || readlink -f "$CHROMIUM_PATH" 2>/dev/null | grep -q snap; then
   IS_SNAP_CHROMIUM=true

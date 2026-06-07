@@ -3,3 +3,4 @@
 - [msUntilNextSlot always-positive pitfall](msuuntilnextslot-pitfall.md) — the "Next slot opens in" pill is always present; guard 24h-limit sleep with usageToday >= usageMax, not just msUntilNextSlot > 0.
 - [CF challenge bypass via cookie persistence](cf-cookie-persistence.md) — save cf_clearance + session cookies after login; restore on restart → CF clears in <1s; reloading page during CF wait resets the challenge loop.
 - [Ubuntu snap Chromium detection](ubuntu-snap-chromium.md) — /usr/bin/chromium-browser is a shell script wrapper (not symlink); use head -5 on the binary to detect /snap/ references, not just readlink.
+- [snap Chromium + root + --no-sandbox](snap-chromium-no-sandbox.md) — snap provides its own confinement; Chrome's INTERNAL sandbox is separate. --no-sandbox is still required when running as root, or Chrome exits before binding DevTools port → ECONNREFUSED.

@@ -545,7 +545,7 @@ async function main() {
     "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
   ];
   const connectArgs = IS_SNAP_CHROMIUM
-    ? [...launcherDefaults, ...commonArgs]
+    ? [...launcherDefaults, ...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"]
     : [...commonArgs, "--no-sandbox", "--disable-setuid-sandbox"];
   const { browser: b, page } = await connect({
     headless: false,

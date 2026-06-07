@@ -128,7 +128,7 @@ async function main() {
     "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync,AutomationControlled",
   ];
   const probeConnectArgs = IS_SNAP_CHROMIUM
-    ? [...launcherDefaultsProbe, ...commonProbeArgs]
+    ? [...launcherDefaultsProbe, ...commonProbeArgs, "--no-sandbox", "--disable-setuid-sandbox"]
     : [...commonProbeArgs, "--no-sandbox", "--disable-setuid-sandbox"];
   const { browser: b, page } = await connect({
     headless: false,
