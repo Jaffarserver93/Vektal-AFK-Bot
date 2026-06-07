@@ -562,17 +562,19 @@ async function handleAdPage(page: any, label: string): Promise<void> {
   }
   log(`[${label}] Continue clicked: ${continueClicked}`);
 
-  // 7. Wait for navigation away from this page
+  // 7. Wait for navigation away from this page (compare base URL without #fragment)
   const currentUrl = page.url();
+  const currentBase = currentUrl.split("#")[0];
   log(`[${label}] Waiting for navigation away from ${currentUrl}…`);
   for (let i = 0; i < 20; i++) {
     await sleep(1000);
-    if (page.url() !== currentUrl) {
+    const nowBase = page.url().split("#")[0];
+    if (nowBase !== currentBase) {
       log(`[${label}] Navigated → ${page.url()}`);
       return;
     }
   }
-  log(`[${label}] Warning: page did not navigate within 20s. Continuing anyway.`);
+  log(`[${label}] Warning: page did not navigate within 20s (only fragment changed or stuck). Giving up on this ad.`);
 }
 
 // ─── bookyourhotel.in handler ─────────────────────────────────────────────────
@@ -918,6 +920,9 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
     const SKIP_DOMAINS  = ["linkpays.in"];
     const MAX_AD_PAGES  = 10;
 
+    let prevAdBase = ""; // base URL (no fragment) of last ad page
+    let samePageCount = 0;
+
     for (let pageNum = 1; pageNum <= MAX_AD_PAGES; pageNum++) {
       // Check both tabs; prefer the one furthest in the chain
       if (newTabPage && newTabPage !== lpPage) {
@@ -932,6 +937,20 @@ async function runOneCycle(browser: any, cycleNum: number): Promise<{
       }
 
       const currentUrl: string = lpPage.url();
+      const currentBase = currentUrl.split("#")[0];
+
+      // Guard: if we're on the same base URL 2+ times in a row, the chain is stuck
+      if (currentBase === prevAdBase) {
+        samePageCount++;
+        if (samePageCount >= 2) {
+          log(`Ad chain stuck on same page ${samePageCount}x (${currentBase}). Breaking out to check /earn.`);
+          break;
+        }
+      } else {
+        samePageCount = 0;
+        prevAdBase = currentBase;
+      }
+
       log(`Ad page ${pageNum}: ${currentUrl}`);
 
       if (DONE_DOMAINS.some(d => currentUrl.includes(d))) {
