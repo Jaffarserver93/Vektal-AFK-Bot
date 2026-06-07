@@ -1012,9 +1012,10 @@ async function runBot(xvfb: ChildProcess, cycleNumRef: { n: number }) {
       }
 
       // ── Decide how long to wait before the next cycle ─────────────────────
-      // Only use server next-slot time when the daily limit is truly exhausted.
-      // msUntilNextSlot is always >0 (rolling timer pill), so we must also check usage.
-      if (!cycleResult.ok && cycleResult.usageToday >= cycleResult.usageMax && cycleResult.msUntilNextSlot > 0) {
+      // If the server reports a next-slot time, honour it — the rolling 24h window
+      // means you can hit the limit with fewer than usageMax total uses if the
+      // oldest uses haven't expired yet.
+      if (!cycleResult.ok && cycleResult.msUntilNextSlot > 0) {
         const sleepMs = cycleResult.msUntilNextSlot + 2 * 60_000;
         log(`24h limit (${cycleResult.usageToday}/${cycleResult.usageMax}). Sleeping ${Math.round(sleepMs / 60_000)}min until next slot…`);
         const wakeAt = Date.now() + sleepMs;
